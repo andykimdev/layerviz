@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "layerviz"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "torch>=2.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "playwright"]
+
+[tool.setuptools.packages.find]
+include = ["layerviz*"]
+
+[tool.setuptools.package-data]
+layerviz = [
+    "web/*.js", "web/*.css", "web/*.html", "web/*.txt",
+    "web/vendor/*.js", "web/vendor/*.css", "web/vendor/*.html", "web/vendor/*.txt",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = ["slow: marks tests that take a long time to run"]

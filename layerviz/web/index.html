@@ -1,0 +1,64 @@
+<!doctype html>
+<!-- Page template of a layerviz bundle. bundle.py replaces the scripts marker below. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>layerviz</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; height: 100vh; display: grid; grid-template-columns: minmax(280px, 1fr) 2fr;
+    font: 13px/1.4 system-ui, sans-serif; color: #1d232a; background: #f6f7f9;
+  }
+  #graph-pane { overflow: auto; border-right: 1px solid #d5d9de; background: #fff; }
+  #graph-svg { display: block; }
+  #graph-svg .box rect { fill: #eef2f7; stroke: #a9b4c2; cursor: pointer; }
+  #graph-svg .box text { fill: #5a6573; font-size: 10px; pointer-events: none; }
+  #graph-svg .node rect { fill: #fff; stroke: #5a6573; rx: 4; cursor: pointer; }
+  #graph-svg .node text { font-size: 11px; pointer-events: none; }
+  #graph-svg .node.empty rect { stroke-dasharray: 3 2; fill: #f3f3f3; }
+  #graph-svg .node.selected rect, #graph-svg .box.selected rect { stroke: #d9480f; stroke-width: 2; }
+  #graph-svg path.edge { fill: none; stroke: #8a94a1; stroke-width: 1.2; }
+  #layer-pane { display: flex; flex-direction: column; min-width: 0; }
+  #controls { display: flex; gap: 12px; align-items: center; padding: 8px 12px;
+    border-bottom: 1px solid #d5d9de; background: #fff; }
+  #main { display: flex; flex: 1; min-height: 0; }
+  #view { flex: 1; padding: 12px; overflow: auto; min-height: 480px; }
+  #view canvas { display: block; margin: 4px 0; border: 1px solid #d5d9de; }
+  .layerviz-legend { color: #5a6573; margin-bottom: 4px; }
+  .layerviz-slice { display: inline-block; margin-right: 12px; vertical-align: top; }
+  .layerviz-slab { margin-right: 12px; }
+  #panel { width: 240px; padding: 12px; border-left: 1px solid #d5d9de; background: #fff;
+    overflow: auto; }
+  #panel dl { margin: 0; }
+  #panel dt { color: #5a6573; margin-top: 8px; }
+  #panel dd { margin: 0; overflow-wrap: anywhere; }
+  #status { color: #a61e4d; }
+</style>
+</head>
+<body>
+<section id="graph-pane"><svg id="graph-svg" role="img" aria-label="Architecture graph"></svg></section>
+<section id="layer-pane">
+  <div id="controls">
+    <label>Color <select id="mode">
+      <option value="pca">PCA</option>
+      <option value="similarity">Similarity</option>
+      <option value="channel">Channel</option>
+      <option value="joint" hidden>Joint PCA</option>
+    </select></label>
+    <label>Channel <select id="channel" disabled></select></label>
+    <span id="status" role="status"></span>
+  </div>
+  <div id="main">
+    <div id="view"><p>Click a layer in the graph to show it.</p></div>
+    <aside id="panel">
+      <dl id="stats"></dl>
+      <dl><dt>Clicked input coordinate</dt><dd id="click">none</dd></dl>
+    </aside>
+  </div>
+</section>
+<!-- layerviz:scripts -->
+</body>
+</html>
