@@ -10,3 +10,7 @@ AGENTS.md
 
 # Local test runs
 runs/
+
+# Python caches
+__pycache__/
+*.pyc
