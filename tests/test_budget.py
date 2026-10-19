@@ -3,10 +3,10 @@ Test the position budget that caps each layer and the whole bundle.
 
 Purpose:
 
-- Check water filling of the total budget and the per layer cap (A14, A33).
+- Check water filling of the total budget and the per layer cap.
 - Check the 1 position floor and warning when the total budget is too small.
 - Check that each layer cap reserves the layer file overhead it is given.
-- Check that layers on the same grid keep the same subsampled positions (A15).
+- Check that layers on the same grid keep the same subsampled positions.
 """
 
 import warnings

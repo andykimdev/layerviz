@@ -2,8 +2,8 @@
 Test the viewer page in headless Chromium from inline and multi file bundles.
 
 Purpose:
-- Check the single file page from file:// and the multi file page over http (A16, A19).
-- Check the side panel, channel mode, and similarity kept across a layer switch (A21).
+- Check the single file page from file:// and the multi file page over http.
+- Check the side panel, channel mode, and similarity kept across a layer switch.
 - Check the PCA fallback note and that a stale channel paint never overwrites a later click.
 
 Special Notes:

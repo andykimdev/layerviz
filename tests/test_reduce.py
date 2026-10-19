@@ -3,7 +3,7 @@ Test the PCA reduction of one layer's features into RGB, scores, and explained v
 
 Purpose:
 
-- Check determinism, explained variance, the k rule, and degenerate inputs (A10 to A13).
+- Check determinism, explained variance, the k rule, and degenerate inputs.
 - Check channel quantization under a byte cap.
 """
 

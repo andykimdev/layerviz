@@ -3,8 +3,8 @@ Test that total_mb bounds the layer files and the channel files together.
 
 Purpose:
 
-- Check that a wide model fits total_mb in single mode and as a whole compare bundle (A14).
-- Check that a squeezed channel file keeps its highest variance channels (A17).
+- Check that a wide model fits total_mb in single mode and as a whole compare bundle.
+- Check that a squeezed channel file keeps its highest variance channels.
 - Check that a model whose channel files fit keeps every channel.
 - Check the byte sharing across channel files and the empty cap that writes no file.
 

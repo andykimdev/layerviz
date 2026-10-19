@@ -145,7 +145,7 @@ def plan_channel_caps(
 
     Returns:
         Largest channel file size per layer in bytes. A file under its even share of what is
-        left keeps all it needs, and the rest share the remainder (A33). Zero when the layer
+        left keeps all it needs, and the rest share the remainder. Zero when the layer
         files leave nothing.
     """
     cap = int(layer_mb * MB)

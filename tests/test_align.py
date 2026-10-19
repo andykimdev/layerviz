@@ -3,8 +3,8 @@ Test the alignment of two models' components, the joint PCA colors, and linear C
 
 Purpose:
 
-- Check that matched components make pane B colors equal pane A colors (A26, A31).
-- Check linear CKA against a dense Gram matrix reference (A27) and the joint fit colors.
+- Check that matched components make pane B colors equal pane A colors.
+- Check linear CKA against a dense Gram matrix reference and the joint fit colors.
 """
 
 import time

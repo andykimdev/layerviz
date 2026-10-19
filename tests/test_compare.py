@@ -3,8 +3,8 @@ Test the comparison bundle that pairs two models' layers by module name.
 
 Purpose:
 
-- Check that channel permuted, sign flipped copies color byte equal in both panes (A26).
-- Check the unpaired names (A25), the CKA per node (A27), and the joint RGB sections (A32).
+- Check that channel permuted, sign flipped copies color byte equal in both panes.
+- Check the unpaired names, the CKA per node, and the joint RGB sections.
 - Check that layers of different widths are flagged as having no joint colors.
 - Check that compare budgets the joint RGB and keeps every layer file within layer_mb.
 

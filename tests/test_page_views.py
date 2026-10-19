@@ -2,9 +2,9 @@
 Test that every view kind renders PCA, similarity after a click, and a picked channel.
 
 Purpose:
-- Capture one multi file bundle per tiny model shape and open each over http (A19, A20).
+- Capture one multi file bundle per tiny model shape and open each over http.
 - Check each view kind draws a 2D or WebGL canvas, recolors after a click, and loads channels late.
-- Check image2d and sparse3d keep the clicked input coordinate across a layer switch (A21).
+- Check image2d and sparse3d keep the clicked input coordinate across a layer switch.
 
 Special Notes:
 - Bundles use inline_mb=0, so layer and channel files are fetched only when needed.

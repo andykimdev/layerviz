@@ -3,7 +3,7 @@ Test the graph layout that turns leaf names and edges into node coordinates and 
 
 Purpose:
 
-- Check ranks, centered x values, unreachable nodes, and reused modules for placement (A19).
+- Check ranks, centered x values, unreachable nodes, and reused modules for placement.
 - Check the root box and that nested containers give nested boxes with larger outer margins.
 
 Special Notes:

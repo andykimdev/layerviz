@@ -3,9 +3,9 @@ Test the model loading helpers and the python -m layerviz capture, compare, and 
 
 Purpose:
 
-- Check that capture from a factory, checkpoint, and sample matches layerviz.capture (A23).
-- Check that compare against random writes a compare bundle and serve answers over http (A19).
-- Check that the package installs from a path and from git and imports without spconv (A24).
+- Check that capture from a factory, checkpoint, and sample matches layerviz.capture.
+- Check that compare against random writes a compare bundle and serve answers over http.
+- Check that the package installs from a path and from git and imports without spconv.
 
 Special Notes:
 

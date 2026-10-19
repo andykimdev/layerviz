@@ -3,7 +3,7 @@ Test the comparison page in headless Chromium from multi file comparison bundles
 
 Purpose:
 - Check two labelled panes, the CKA row, and the fit switch between aligned and joint colors.
-- Check that a click in pane A recolors pane B from its own scores, and the shared camera (A28).
+- Check that a click in pane A recolors pane B from its own scores, and the shared camera.
 - Check that a pair without joint colors disables the joint option and shows a note.
 
 Special Notes:

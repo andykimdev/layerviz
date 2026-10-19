@@ -3,8 +3,8 @@ Test the shape plugin base: grid to input coordinates and the plugin registry.
 
 Purpose:
 
-- Check that downsampled grid cells map to input coordinates (A6).
-- Check registration order, acceptance lookup, and name overrides (A8).
+- Check that downsampled grid cells map to input coordinates.
+- Check registration order, acceptance lookup, and name overrides.
 """
 
 from dataclasses import dataclass
