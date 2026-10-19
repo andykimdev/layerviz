@@ -1,13 +1,3 @@
-# Agent scaffold, local files
-CLAUDE.md
-INDEX.md
-descriptions.yaml
-AGENTS.md
-.claude/
-.tasks/
-.agents/
-.codex/
-
 # Local test runs
 runs/
 
