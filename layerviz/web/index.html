@@ -59,6 +59,17 @@
     </aside>
   </div>
 </section>
+<script>
+  // Browsers refuse module scripts on file:// pages, so a split bundle opened from disk
+  // never runs app.js. This classic script tells the user to serve the folder instead.
+  document.addEventListener("DOMContentLoaded", () => {
+    if (location.protocol !== "file:" || document.getElementById("graph")) return;
+    const folder = decodeURIComponent(location.pathname.replace(/\/[^/]*$/, "")) || ".";
+    document.getElementById("status").textContent = "This bundle keeps its layers in separate"
+      + " files, which a page opened from disk cannot read. Run python -m layerviz serve "
+      + `"${folder}" and open the address it prints.`;
+  });
+</script>
 <!-- layerviz:scripts -->
 </body>
 </html>

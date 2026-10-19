@@ -2,41 +2,13 @@
  * Compute click to similarity for the viewer in pure JavaScript with no DOM access.
  *
  * Purpose:
- * - Decode float16 score bundles and compute cosine similarity against a clicked row.
+ * - Compute cosine similarity of decoded scores against a clicked row.
  * - Turn similarity into percentile ranks and map a 3D point to its nearest position.
  *
  * Special Notes:
  * - Sums accumulate in doubles and only results are stored as Float32Array.
+ * - Scores arrive already decoded by decodeFloat16 in format.js.
  */
-
-const FLOAT16_SUBNORMAL_SCALE = 2 ** -24;
-
-/**
- * Decode one IEEE 754 half precision bit pattern into a number.
- *
- * @param {number} bits Unsigned 16 bit pattern.
- * @returns {number} Decoded value, including subnormals, signed zero, infinity, and NaN.
- */
-function decodeFloat16(bits) {
-  const sign = bits & 0x8000 ? -1 : 1;
-  const exponent = (bits >> 10) & 0x1f;
-  const mantissa = bits & 0x3ff;
-  if (exponent === 0) return sign * mantissa * FLOAT16_SUBNORMAL_SCALE;
-  if (exponent === 0x1f) return mantissa ? NaN : sign * Infinity;
-  return sign * 2 ** (exponent - 15) * (1 + mantissa / 1024);
-}
-
-/**
- * Decode an array of float16 bit patterns into float32 values.
- *
- * @param {Uint16Array} uint16Array Raw half precision bit patterns.
- * @returns {Float32Array} Decoded values of the same length.
- */
-export function float16ToFloat32(uint16Array) {
-  const out = new Float32Array(uint16Array.length);
-  for (let i = 0; i < uint16Array.length; i += 1) out[i] = decodeFloat16(uint16Array[i]);
-  return out;
-}
 
 /**
  * Compute the Euclidean norm of every row of a row major matrix.
@@ -78,7 +50,8 @@ function rowDot(scores, k, a, b) {
  * @param {number} n Number of rows.
  * @param {number} k Number of columns.
  * @param {number} index Row to compare against, the clicked position.
- * @returns {Float32Array} Similarity per row in -1..1, 0 where either row has zero norm.
+ * @returns {Float32Array} Similarity per row in -1..1, 0 where either row has zero norm
+ *   or holds Infinity or NaN, so percentileRank always sees finite values.
  * @throws {RangeError} When index is not an integer in 0..n-1.
  */
 export function cosineSimilarity(scores, n, k, index) {
@@ -89,7 +62,7 @@ export function cosineSimilarity(scores, n, k, index) {
   const out = new Float32Array(n);
   for (let row = 0; row < n; row += 1) {
     const denom = norms[row] * norms[index];
-    out[row] = denom > 0 ? rowDot(scores, k, row, index) / denom : 0;
+    out[row] = denom > 0 && Number.isFinite(denom) ? rowDot(scores, k, row, index) / denom : 0;
   }
   return out;
 }

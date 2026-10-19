@@ -7,145 +7,18 @@
  *
  * Special Notes:
  * - three.js and OrbitControls load from ./vendor/ so bundles work offline.
- * - slabMask, boundsOf, nearestOnRay, rgbaColors, and clampSlab are pure, so Node tests them.
+ * - The pure geometry lives in geometry3d.js, so Node tests it without WebGL.
  */
 
 import * as THREE from "./vendor/three.module.min.js";
 import { OrbitControls } from "./vendor/OrbitControls.js";
-import { legend } from "./colors.js";
+import {
+  boundsOf, canvasSize, clampSlab, nearestOnRay, rgbaColors, screenAxes, slabMask, toScreen,
+} from "./geometry3d.js";
+import { resetRoot } from "./legend.js";
 
-const DEFAULT_SIDE_PX = 480;
 const CLICK_SLOP_PX = 4;
 const SLAB_STEPS = 100;
-const AXIS_NAMES = ["x", "y", "z"];
-
-/**
- * Mark the positions whose coordinate on one axis lies inside a slab.
- *
- * @param {ArrayLike<number>} positions N*3 coordinates.
- * @param {number} n Position count.
- * @param {number} axis Axis index 0, 1, or 2 the slab is measured along.
- * @param {number} center Slab center on that axis.
- * @param {number} thickness Full slab thickness. Points within half of it are inside.
- * @returns {Uint8Array} One byte per position, 1 inside the slab and 0 outside.
- */
-export function slabMask(positions, n, axis, center, thickness) {
-  const half = thickness / 2;
-  const mask = new Uint8Array(n);
-  for (let i = 0; i < n; i += 1) {
-    mask[i] = Math.abs(positions[i * 3 + axis] - center) <= half ? 1 : 0;
-  }
-  return mask;
-}
-
-/**
- * Return the axis aligned bounds of a point set and the sphere around them.
- *
- * @param {ArrayLike<number>} positions N*3 coordinates.
- * @param {number} n Position count, at least 1.
- * @returns {{min: number[], max: number[], center: number[], radius: number}} Corners, the
- *   box center, and half the box diagonal.
- * @throws {Error} When n is 0, since an empty set has no bounds.
- */
-export function boundsOf(positions, n) {
-  if (n < 1) {
-    throw new Error("boundsOf needs at least one position, got 0");
-  }
-  const min = [Infinity, Infinity, Infinity];
-  const max = [-Infinity, -Infinity, -Infinity];
-  for (let i = 0; i < n; i += 1) {
-    for (let a = 0; a < 3; a += 1) {
-      min[a] = Math.min(min[a], positions[i * 3 + a]);
-      max[a] = Math.max(max[a], positions[i * 3 + a]);
-    }
-  }
-  const center = min.map((low, a) => (low + max[a]) / 2);
-  const radius = Math.hypot(...min.map((low, a) => max[a] - low)) / 2;
-  return { min, max, center, radius };
-}
-
-/**
- * Return the visible position closest to a ray, measured perpendicular to the ray line.
- *
- * Positions behind the ray origin are skipped, so the camera never picks what it cannot see.
- *
- * @param {ArrayLike<number>} positions N*3 coordinates.
- * @param {number} n Position count.
- * @param {number[]} origin Ray origin [x, y, z].
- * @param {number[]} direction Ray direction [x, y, z], any nonzero length.
- * @param {Uint8Array} [mask] Optional visibility per position. Zeros are never picked.
- * @returns {number} The position index, or -1 when no position is visible ahead of origin.
- */
-export function nearestOnRay(positions, n, origin, direction, mask) {
-  const length = Math.hypot(...direction);
-  const unit = direction.map((value) => value / length);
-  let best = -1;
-  let bestDistance = Infinity;
-  for (let i = 0; i < n; i += 1) {
-    if (mask && !mask[i]) {
-      continue;
-    }
-    const offset = [0, 1, 2].map((a) => positions[i * 3 + a] - origin[a]);
-    const along = offset[0] * unit[0] + offset[1] * unit[1] + offset[2] * unit[2];
-    if (along < 0) {
-      continue;
-    }
-    const distance = Math.hypot(...offset.map((value, a) => value - along * unit[a]));
-    if (distance < bestDistance) {
-      best = i;
-      bestDistance = distance;
-    }
-  }
-  return best;
-}
-
-/**
- * Join N*3 colors and a slab mask into N*4 colors whose alpha hides points outside.
- *
- * @param {ArrayLike<number>} colors N*3 color bytes from colors.js colorsFrom.
- * @param {Uint8Array} mask One byte per position, nonzero when visible.
- * @param {number} n Position count.
- * @returns {Uint8Array} N*4 bytes, alpha 255 for visible points and 0 for hidden ones.
- * @throws {Error} When colors does not hold 3 bytes per position.
- */
-export function rgbaColors(colors, mask, n) {
-  if (colors?.length !== n * 3) {
-    throw new Error(`rgbaColors needs ${n * 3} color bytes, got ${colors?.length ?? "none"}`);
-  }
-  const out = new Uint8Array(n * 4);
-  for (let i = 0; i < n; i += 1) {
-    out[i * 4] = colors[i * 3];
-    out[i * 4 + 1] = colors[i * 3 + 1];
-    out[i * 4 + 2] = colors[i * 3 + 2];
-    out[i * 4 + 3] = mask[i] ? 255 : 0;
-  }
-  return out;
-}
-
-/**
- * Return a slab that fits the bounds, so one kept from another layer cannot hide every point.
- *
- * @param {{axis: number, center: number, thickness: number}} [slab] Slab to fit, if any.
- * @param {{min: number[], max: number[], center: number[]}} bounds Bounds of the points.
- * @returns {{axis: number, center: number, thickness: number}} A new slab whose center lies
- *   inside the bounds on its axis and whose thickness is at most that extent. A missing or
- *   invalid slab becomes the whole z extent.
- */
-export function clampSlab(slab, bounds) {
-  const valid = slab && [0, 1, 2].includes(slab.axis)
-    && Number.isFinite(slab.center) && Number.isFinite(slab.thickness);
-  if (!valid) {
-    return { axis: 2, center: bounds.center[2], thickness: bounds.max[2] - bounds.min[2] };
-  }
-  const { axis } = slab;
-  const low = bounds.min[axis];
-  const high = bounds.max[axis];
-  return {
-    axis,
-    center: Math.min(Math.max(slab.center, low), high),
-    thickness: Math.min(Math.max(slab.thickness, 0), high - low),
-  };
-}
 
 /**
  * Create a camera looking at the point cloud from outside its bounding sphere.
@@ -164,7 +37,7 @@ function makeCamera(bounds) {
 /**
  * Create the Points object with a position attribute and an RGBA color attribute.
  *
- * @param {Float32Array} positions N*3 coordinates.
+ * @param {Float32Array} positions N*3 coordinates in screen axis order, from toScreen.
  * @param {Uint8Array} rgba N*4 colors from rgbaColors.
  * @param {number} radius Bounding sphere radius, which sets the point size.
  * @returns {THREE.Points} The points, whose alphaTest discards hidden ones.
@@ -206,11 +79,16 @@ function rangeControl(label, range, onInput) {
  *
  * @param {object} state View state with a valid slab.
  * @param {{min: number[], max: number[], center: number[]}} bounds Bounds of the points.
+ * @param {string[]} names Stored column name per screen axis, from screenAxes, shown as the
+ *   axis slider title.
  * @param {function(): void} onChange Called after state.slab changes.
- * @returns {HTMLElement} A wrapper holding the three sliders.
+ * @returns {HTMLElement} A wrapper holding the three sliders. The axis slider runs over the
+ *   screen axes in (z, y, x) order, while state.slab.axis keeps the screen axis index.
  */
-function slabControls(state, bounds, onChange) {
+function slabControls(state, bounds, names, onChange) {
   const extent = (axis) => Math.max(bounds.max[axis] - bounds.min[axis], 1e-6);
+  // Slider value 0 is screen axis 2, so the slider lists z, y, x like a stored voxel index.
+  const screenAxisOf = (value) => 2 - value;
   const { axis } = state.slab;
   const center = rangeControl("center", {
     min: bounds.min[axis], max: bounds.max[axis], step: extent(axis) / SLAB_STEPS,
@@ -219,17 +97,19 @@ function slabControls(state, bounds, onChange) {
   const thickness = rangeControl("thickness", {
     min: 0, max: extent(axis), step: extent(axis) / SLAB_STEPS, value: state.slab.thickness,
   }, (value) => { state.slab.thickness = value; onChange(); });
-  const axisInput = rangeControl("axis", { min: 0, max: 2, step: 1, value: axis }, (value) => {
-    state.slab = { axis: value, center: bounds.center[value], thickness: extent(value) };
-    Object.assign(center.input, { min: bounds.min[value], max: bounds.max[value] });
-    center.input.step = String(extent(value) / SLAB_STEPS);
+  const range = { min: 0, max: 2, step: 1, value: screenAxisOf(axis) };
+  const axisInput = rangeControl("axis", range, (value) => {
+    const next = screenAxisOf(value);
+    state.slab = { axis: next, center: bounds.center[next], thickness: extent(next) };
+    Object.assign(center.input, { min: bounds.min[next], max: bounds.max[next] });
+    center.input.step = String(extent(next) / SLAB_STEPS);
     center.input.value = String(state.slab.center);
-    Object.assign(thickness.input, { max: extent(value), step: extent(value) / SLAB_STEPS });
+    Object.assign(thickness.input, { max: extent(next), step: extent(next) / SLAB_STEPS });
     thickness.input.value = String(state.slab.thickness);
-    axisInput.input.title = AXIS_NAMES[value];
+    axisInput.input.title = names[next];
     onChange();
   });
-  axisInput.input.title = AXIS_NAMES[axis];
+  axisInput.input.title = names[axis];
   const wrapper = document.createElement("div");
   wrapper.className = "layerviz-slab-controls";
   wrapper.append(axisInput.wrapper, center.wrapper, thickness.wrapper);
@@ -273,113 +153,184 @@ function rayUnder(event, canvas, camera) {
 }
 
 /**
- * Empty a root element and give it a legend line for the current colors.
+ * Set the legend line of a view root to a caption, adding the line first when it is missing.
  *
  * @param {HTMLElement} root Element the view renders into.
- * @param {object} state View state, whose optional mode names the color mode.
+ * @param {string} caption Legend text for the current color mode.
  */
-function resetRoot(root, state) {
-  root.replaceChildren();
-  if (state.mode) {
-    const caption = document.createElement("div");
-    caption.className = "layerviz-legend";
-    caption.textContent = legend(state.mode);
-    root.append(caption);
+export function showCaption(root, caption) {
+  let line = root.querySelector(".layerviz-legend");
+  if (!line) {
+    line = document.createElement("div");
+    line.className = "layerviz-legend";
+    root.prepend(line);
   }
+  line.textContent = caption;
 }
 
 /**
- * Create a renderer sized to root, orbit controls on the camera, and a frame loop drawing scene.
+ * Return the outer height of an element, its border box plus its vertical margins.
  *
- * @param {HTMLElement} root Element whose size sets the canvas size.
+ * @param {Element} element Element to measure.
+ * @returns {number} Height in CSS pixels.
+ */
+function outerHeight(element) {
+  const style = getComputedStyle(element);
+  const margins = (parseFloat(style.marginTop) || 0) + (parseFloat(style.marginBottom) || 0);
+  return element.getBoundingClientRect().height + margins;
+}
+
+/**
+ * Measure the pane content box and the room its other content takes beside the canvas.
+ *
+ * @param {HTMLElement} root Pane holding the canvas.
+ * @param {HTMLCanvasElement} canvas Canvas inside the pane.
+ * @returns {object} The pane argument of geometry3d.js canvasSize.
+ */
+function measurePane(root, canvas) {
+  const style = getComputedStyle(root);
+  const padding = ["Top", "Right", "Bottom", "Left"]
+    .map((side) => parseFloat(style[`padding${side}`]) || 0);
+  const outer = [...root.children].reduce((sum, child) => sum + outerHeight(child), 0);
+  return {
+    width: root.clientWidth,
+    height: root.clientHeight,
+    padding,
+    reserved: outer - canvas.getBoundingClientRect().height,
+    overflowing: root.scrollHeight > root.clientHeight,
+  };
+}
+
+/**
+ * Size the canvas to its pane now and again whenever the pane resizes.
+ *
+ * @param {HTMLElement} root Pane holding the canvas and the slab controls.
+ * @param {THREE.WebGLRenderer} renderer Renderer whose canvas is sized.
+ * @returns {function(): void} Stops following the pane.
+ */
+function followPane(root, renderer) {
+  const canvas = renderer.domElement;
+  const fit = () => {
+    // A collapsed canvas lets the pane report the room its layout gives it, not the room the
+    // old canvas props open, so the canvas shrinks with the window as well as growing.
+    canvas.style.height = "0px";
+    const size = canvasSize(measurePane(root, canvas));
+    renderer.setSize(size.width, size.height, false);
+    canvas.style.height = `${size.height}px`;
+  };
+  fit();
+  let frame = 0;
+  // Fitting on the next frame keeps a resize inside the callback from looping the observer.
+  const observer = new ResizeObserver(() => { frame = requestAnimationFrame(fit); });
+  observer.observe(root);
+  return () => {
+    observer.disconnect();
+    cancelAnimationFrame(frame);
+  };
+}
+
+/**
+ * Add a canvas sized to its pane, orbit controls on the camera, and a frame loop drawing scene.
+ *
+ * @param {HTMLElement} root Pane to append the canvas and then the slab controls to.
  * @param {THREE.Scene} scene Scene to draw every frame.
  * @param {THREE.PerspectiveCamera} camera Camera to orbit, possibly shared with other panes.
  * @param {{center: number[]}} bounds Bounds of the points, whose center the controls orbit.
- * @returns {{renderer: THREE.WebGLRenderer, controls: OrbitControls}} The running renderer
- *   and its controls, both for the caller to dispose.
+ * @param {HTMLElement} sliders Slab controls, placed before the canvas is measured.
+ * @returns {{renderer: THREE.WebGLRenderer, stop: function(): void}} The running renderer and
+ *   a function that stops its loop, controls, and pane resizing.
  */
-function startRenderer(root, scene, camera, bounds) {
+function startRenderer(root, scene, camera, bounds, sliders) {
   const renderer = new THREE.WebGLRenderer({ antialias: true });
   if (typeof devicePixelRatio === "number") {
     renderer.setPixelRatio(devicePixelRatio);
   }
-  // A compare pane holds only its caption at this point, so its height is no canvas size.
-  const height = Math.max(root.clientHeight, DEFAULT_SIDE_PX);
-  let width = root.clientWidth || DEFAULT_SIDE_PX;
-  renderer.setSize(width, height);
   const canvas = renderer.domElement;
-  // The first compare pane is measured before the second exists, so the width follows the pane.
-  Object.assign(canvas.style, { width: "100%", boxSizing: "border-box" });
+  // A zero height canvas lets a pane sized by its content report no room before the first fit.
+  Object.assign(canvas.style,
+    { display: "block", width: "100%", height: "0px", boxSizing: "border-box" });
+  root.append(canvas, sliders);
+  const unfollow = followPane(root, renderer);
   const controls = new OrbitControls(camera, canvas);
   controls.target.set(...bounds.center);
   controls.update();
   // A frame loop keeps panes that share one camera in step when another pane orbits it.
   renderer.setAnimationLoop(() => {
-    if (canvas.clientWidth && canvas.clientWidth !== width) {
-      width = canvas.clientWidth;
-      renderer.setSize(width, height, false);
-    }
     camera.aspect = canvas.clientWidth / Math.max(canvas.clientHeight, 1) || 1;
     camera.updateProjectionMatrix();
     renderer.render(scene, camera);
   });
-  return { renderer, controls };
+  const stop = () => {
+    renderer.setAnimationLoop(null);
+    unfollow();
+    controls.dispose();
+  };
+  return { renderer, stop };
 }
 
 /**
  * Render a sparse3d or points layer as a rotatable point cloud with slab sliders.
  *
  * @param {HTMLElement} root Element to render into, cleared first.
- * @param {object} record Decoded layer record whose positions are N*3.
+ * @param {object} record Decoded layer record whose positions are N*3 in stored column order.
  * @param {Uint8Array} colors N*3 colors to draw.
  * @param {object} state View state. state.camera is created when missing and shared by
  *   panes given the same state.camera. state.slab is filled and rewritten by the sliders.
  *   Optional mode and onPick(positionIndex).
- * @returns {{updateColors: function(Uint8Array): void, dispose: function(): void}} A handle
- *   that recolors without rebuilding the scene, and one that stops rendering.
- * @throws {Error} When the record positions are not 3 dimensional or the layer is empty.
+ * @returns {{setColors: function(Uint8Array, string=): void,
+ *   updateColors: function(Uint8Array): void, dispose: function(): void}} setColors recolors
+ *   the points on the same canvas and sets the legend caption when one is given.
+ *   updateColors recolors only. dispose stops rendering and frees the WebGL context.
+ * @throws {Error} When the positions are not 3 dimensional, the layer is empty, or the
+ *   layer kind has no 3D axis order.
  */
 export function renderPoints(root, record, colors, state) {
-  const { n, dim } = record.header;
+  const { n, dim, kind } = record.header;
   if (dim !== 3) {
     throw new Error(`renderPoints needs 3 dimensional positions, this layer has dim ${dim}`);
   }
+  const axes = screenAxes(kind);
+  const positions = toScreen(record.positions, n, axes.columns);
   resetRoot(root, state);
-  const bounds = boundsOf(record.positions, n);
+  const bounds = boundsOf(positions, n);
   state.slab = clampSlab(state.slab, bounds);
   state.camera ??= makeCamera(bounds);
   let current = colors;
-  const maskNow = () => slabMask(record.positions, n, state.slab.axis, state.slab.center,
+  const maskNow = () => slabMask(positions, n, state.slab.axis, state.slab.center,
     state.slab.thickness);
   let mask = maskNow();
-  const points = makePoints(record.positions, rgbaColors(current, mask, n), bounds.radius);
+  const points = makePoints(positions, rgbaColors(current, mask, n), bounds.radius);
   const scene = new THREE.Scene();
   scene.add(points);
-  const { renderer, controls } = startRenderer(root, scene, state.camera, bounds);
   const recolor = () => {
     points.geometry.getAttribute("color").array.set(rgbaColors(current, mask, n));
     points.geometry.getAttribute("color").needsUpdate = true;
   };
-  const sliders = slabControls(state, bounds, () => { mask = maskNow(); recolor(); });
+  const sliders = slabControls(state, bounds, axes.names, () => { mask = maskNow(); recolor(); });
+  const { renderer, stop } = startRenderer(root, scene, state.camera, bounds, sliders);
   onStillClick(renderer.domElement, (event) => {
     const { origin, direction } = rayUnder(event, renderer.domElement, state.camera);
-    const index = nearestOnRay(record.positions, n, origin, direction, mask);
+    const index = nearestOnRay(positions, n, origin, direction, mask);
     if (index >= 0 && state.onPick) {
       state.onPick(index);
     }
   });
-  root.append(renderer.domElement, sliders);
+  const setColors = (next, caption) => {
+    current = next;
+    recolor();
+    if (caption !== undefined) {
+      showCaption(root, caption);
+    }
+  };
   return {
-    updateColors(next) {
-      current = next;
-      recolor();
-    },
+    setColors,
+    updateColors: (next) => setColors(next),
     dispose() {
-      renderer.setAnimationLoop(null);
-      controls.dispose();
+      stop();
       points.geometry.dispose();
       points.material.dispose();
       renderer.dispose();
+      renderer.forceContextLoss();
     },
   };
 }

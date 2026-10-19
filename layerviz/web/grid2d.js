@@ -137,16 +137,26 @@ function withTokenGrid(record) {
   return { ...record, header: { ...record.header, grid: [n] } };
 }
 
+const TOKEN_CELLS = new WeakMap();
+
 /**
- * Return the sequence index of every kept token, from its position.
+ * Return the sequence index of every kept token, from its position, built once per record.
+ *
+ * The result is cached by record, so mousemove over the token grid does not rebuild it.
+ * Records are treated as immutable, as parseLayer returns them.
  *
  * @param {object} record Decoded tokens layer record.
  * @returns {{tokens: Int32Array, total: number}} Token index per position, and the
- *   sequence length the grid wraps.
+ *   sequence length the grid wraps. The same object on every call for one record.
  */
-function tokenCells(record) {
-  const gridded = withTokenGrid(record);
-  return { tokens: cellsOf(gridded), total: gridded.header.grid[0] };
+export function tokenCells(record) {
+  let cached = TOKEN_CELLS.get(record);
+  if (!cached) {
+    const gridded = withTokenGrid(record);
+    cached = { tokens: cellsOf(gridded), total: gridded.header.grid[0] };
+    TOKEN_CELLS.set(record, cached);
+  }
+  return cached;
 }
 
 /**
@@ -181,14 +191,33 @@ export function tokenIndex(record, [row, col]) {
 }
 
 /**
+ * Return the smallest and largest of the values in one pass.
+ *
+ * A loop instead of a spread, since Math.min(...values) throws RangeError on a layer of
+ * more than about 130000 values.
+ *
+ * @param {number[]} values Values on one axis, of any length.
+ * @returns {number[]} [low, high], or [Infinity, -Infinity] when values is empty.
+ */
+function rangeOf(values) {
+  let low = Infinity;
+  let high = -Infinity;
+  for (const v of values) {
+    low = Math.min(low, v);
+    high = Math.max(high, v);
+  }
+  return [low, high];
+}
+
+/**
  * Rescale values to 0..1, mapping an axis with no spread to 0.5.
  *
  * @param {number[]} values Values on one axis.
  * @returns {number[]} The rescaled values.
  */
 function unitScale(values) {
-  const low = Math.min(...values);
-  const span = Math.max(...values) - low;
+  const [low, high] = rangeOf(values);
+  const span = high - low;
   return values.map((v) => (span > 0 ? (v - low) / span : 0.5));
 }
 

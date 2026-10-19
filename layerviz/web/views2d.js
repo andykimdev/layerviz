@@ -9,7 +9,7 @@
  * - Only this module touches the DOM. grid2d.js holds the pixel and cell math Node tests.
  */
 
-import { legend } from "./colors.js";
+import { resetRoot } from "./legend.js";
 import { nearestIndex } from "./similarity.js";
 import {
   SCATTER_PX,
@@ -26,22 +26,6 @@ import {
 } from "./grid2d.js";
 
 const TOKEN_CELL_PX = 24;
-
-/**
- * Empty a root element and give it a legend line for the current colors.
- *
- * @param {HTMLElement} root Element the view renders into.
- * @param {object} state View state, whose optional mode names the color mode.
- */
-function resetRoot(root, state) {
-  root.replaceChildren();
-  if (state.mode) {
-    const caption = document.createElement("div");
-    caption.className = "layerviz-legend";
-    caption.textContent = legend(state.mode);
-    root.append(caption);
-  }
-}
 
 /**
  * Create a canvas showing an image, scaled up by CSS with crisp pixels.

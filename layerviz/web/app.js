@@ -11,16 +11,18 @@
  * - #view carries data-node, data-mode and data-channel once a layer is drawn, for tests.
  * - A mode that cannot apply yet draws PCA with a note in #status, keeping the menu choice.
  * - A compare graph loads both panes of a node and hands drawing to compare.js.
+ * - Every load error names its file. The serve hint for a split bundle opened from disk lives
+ *   in index.html, because browsers never run this module on such a page.
+ * - The SVG graph drawing lives in graphview.js.
  */
 
 import { base64ToBuffer, parseChannels, parseLayer } from "./format.js";
-import { colorsFrom } from "./colors.js";
+import { colorsFrom, legend } from "./colors.js";
 import { paintCompare, similarityAt } from "./compare.js";
+import { drawGraph } from "./graphview.js";
 import { renderImage2D, renderTokens, renderVector, renderVolume3D } from "./views2d.js";
 import { renderPoints } from "./views3d.js";
 
-const SVG_NS = "http://www.w3.org/2000/svg";
-const LAYOUT = { unitX: 220, unitY: 100, nodeW: 120, nodeH: 24, pad: 16 };
 const RENDERERS = {
   image2d: renderImage2D, volume3d: renderVolume3D, tokens: renderTokens, vector: renderVector,
   sparse3d: renderPoints, points: renderPoints,
@@ -32,17 +34,66 @@ const cache = new Map();
 const app = { graph: null, nodes: new Map(), current: null, click: null, serial: 0, ui: null };
 
 /**
+ * Fetch one bundle file, naming the file in every error.
+ *
+ * @param {string} path Bundle relative path.
+ * @returns {Promise<Response>} The ok response.
+ * @throws {Error} When the connection fails or the HTTP status is not ok.
+ */
+async function fetchFile(path) {
+  let response;
+  try {
+    response = await fetch(path);
+  } catch (error) {
+    throw new Error(`${path} could not be fetched: ${error.message}`, { cause: error });
+  }
+  if (!response.ok) throw new Error(`${path} failed to load with HTTP ${response.status}`);
+  return response;
+}
+
+/**
+ * Parse JSON text, naming the file it came from when it is not valid.
+ *
+ * @param {string} path Bundle relative path of the text.
+ * @param {string} text JSON text.
+ * @returns {object} The parsed value.
+ * @throws {Error} When the text is not valid JSON.
+ */
+function parseJson(path, text) {
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    throw new Error(`${path} is not valid JSON: ${error.message}`, { cause: error });
+  }
+}
+
+/**
  * Read the graph from the inline #graph script when present, else fetch graph.json.
  *
  * @returns {Promise<object>} The parsed graph.
- * @throws {Error} When graph.json cannot be fetched.
+ * @throws {Error} When graph.json cannot be fetched or is not valid JSON, naming the file.
  */
 export async function loadGraph() {
   const inline = document.getElementById("graph");
-  if (inline) return JSON.parse(inline.textContent);
-  const response = await fetch("graph.json");
-  if (!response.ok) throw new Error(`graph.json failed to load with HTTP ${response.status}`);
-  return response.json();
+  if (inline) return parseJson("graph.json", inline.textContent);
+  const response = await fetchFile("graph.json");
+  return parseJson("graph.json", await response.text());
+}
+
+/**
+ * Decode the base64 text of an inline bundle file, naming the file when it is not valid.
+ *
+ * @param {string} path Bundle relative path of the inline file.
+ * @param {string} text Base64 text.
+ * @returns {ArrayBuffer} The file bytes.
+ * @throws {Error} When the text is not valid base64.
+ */
+function decodeInline(path, text) {
+  try {
+    return base64ToBuffer(text);
+  } catch (error) {
+    throw new Error(`${path}: ${error.message}`, { cause: error });
+  }
 }
 
 /**
@@ -50,14 +101,12 @@ export async function loadGraph() {
  *
  * @param {string} path Bundle relative path such as layers/L0007.bin.
  * @returns {Promise<ArrayBuffer>} The file bytes.
- * @throws {Error} When the fetch fails.
+ * @throws {Error} When the file cannot be read or decoded, naming the file.
  */
 async function readBytes(path) {
   const inline = document.querySelector(`script[data-path="${CSS.escape(path)}"]`);
-  if (inline) return base64ToBuffer(inline.textContent.trim());
-  const response = await fetch(path);
-  if (!response.ok) throw new Error(`${path} failed to load with HTTP ${response.status}`);
-  return response.arrayBuffer();
+  if (inline) return decodeInline(path, inline.textContent.trim());
+  return (await fetchFile(path)).arrayBuffer();
 }
 
 /**
@@ -84,113 +133,6 @@ function loadCached(path, parse) {
  */
 export function loadLayer(path) {
   return loadCached(path, parseLayer);
-}
-
-/**
- * Create an SVG element with the given attributes.
- *
- * @param {string} tag SVG tag name.
- * @param {object} attrs Attribute names to values.
- * @returns {SVGElement} The element.
- */
-function svgElement(tag, attrs = {}) {
-  const element = document.createElementNS(SVG_NS, tag);
-  Object.entries(attrs).forEach(([name, value]) => element.setAttribute(name, String(value)));
-  return element;
-}
-
-/**
- * Return a function from layout units to pixels and the pixel size of the whole graph.
- *
- * @param {object} graph Graph with leaf nodes at x, y and boxes at x0, y0, x1, y1.
- * @returns {{px: function(number, number): number[], width: number, height: number}} The map.
- */
-function pixelFrame(graph) {
-  const leaves = graph.nodes.filter((node) => node.leaf);
-  const [halfX, halfY] = [LAYOUT.nodeW / 2 / LAYOUT.unitX, LAYOUT.nodeH / 2 / LAYOUT.unitY];
-  const xs = leaves.flatMap((n) => [n.x - halfX, n.x + halfX]);
-  const ys = leaves.flatMap((n) => [n.y - halfY, n.y + halfY]);
-  graph.boxes.forEach((box) => { xs.push(box.x0, box.x1); ys.push(box.y0, box.y1); });
-  const [minX, minY] = [Math.min(...xs), Math.min(...ys)];
-  const px = (x, y) => [
-    (x - minX) * LAYOUT.unitX + LAYOUT.pad, (y - minY) * LAYOUT.unitY + LAYOUT.pad,
-  ];
-  const [width, height] = px(Math.max(...xs), Math.max(...ys)).map((v) => v + LAYOUT.pad);
-  return { px, width, height };
-}
-
-/**
- * Create a clickable group holding a rect and a label, with the full name as a tooltip.
- *
- * @param {string} className Group class, node or box. Box labels sit at the top left.
- * @param {number[]} rect Pixel [x, y, width, height].
- * @param {string} label Text drawn inside the rect.
- * @param {function(): void} onClick Called when the group is clicked.
- * @returns {SVGGElement} The group.
- */
-function labelledRect(className, [x, y, width, height], label, onClick) {
-  const group = svgElement("g", { class: className });
-  const title = svgElement("title");
-  const text = svgElement("text", { x: x + 6, y: y + (className === "box" ? 12 : height / 2 + 4) });
-  title.textContent = text.textContent = label;
-  group.append(title, svgElement("rect", { x, y, width, height }), text);
-  // Stopping propagation keeps a click on a node from also selecting its enclosing box.
-  group.addEventListener("click", (event) => { event.stopPropagation(); onClick(); });
-  return group;
-}
-
-/**
- * Create a curved edge from the bottom of one node to the top of another.
- *
- * @param {function(number, number): number[]} px Layout units to pixels.
- * @param {Map<string, object>} byId Graph nodes by id.
- * @param {string[]} edge The [from id, to id] pair.
- * @returns {SVGPathElement} The path.
- * @throws {Error} When the edge names a node the graph lacks.
- */
-function edgePath(px, byId, [fromId, toId]) {
-  const [from, to] = [byId.get(fromId), byId.get(toId)];
-  if (!from || !to) throw new Error(`graph edge ${fromId} to ${toId} names a missing node`);
-  const [x1, y1] = px(from.x, from.y).map((v, a) => v + (a ? LAYOUT.nodeH / 2 : 0));
-  const [x2, y2] = px(to.x, to.y).map((v, a) => v - (a ? LAYOUT.nodeH / 2 : 0));
-  const bend = (y2 - y1) / 2;
-  return svgElement("path", {
-    class: "edge", d: `M ${x1} ${y1} C ${x1} ${y1 + bend}, ${x2} ${y2 - bend}, ${x2} ${y2}`,
-  });
-}
-
-/**
- * Draw the graph into an SVG: boxes with container names, leaves with module names, edges.
- *
- * @param {object} graph Graph in the graph.json schema.
- * @param {SVGSVGElement} svg Target element, cleared first.
- * @param {function(string): void} onSelect Called with the node id a click selects. A box
- *   selects the node whose name is the box name.
- */
-export function drawGraph(graph, svg, onSelect) {
-  const { px, width, height } = pixelFrame(graph);
-  svg.replaceChildren();
-  Object.entries({ width, height, viewBox: `0 0 ${width} ${height}` })
-    .forEach(([name, value]) => svg.setAttribute(name, String(value)));
-  const byName = new Map(graph.nodes.map((node) => [node.name, node]));
-  const byId = new Map(graph.nodes.map((node) => [node.id, node]));
-  for (const box of [...graph.boxes].sort((a, b) => a.depth - b.depth)) {
-    const [[x0, y0], [x1, y1]] = [px(box.x0, box.y0), px(box.x1, box.y1)];
-    const own = byName.get(box.name);
-    const rect = [x0, y0, x1 - x0, y1 - y0];
-    const group = labelledRect("box", rect, box.name, () => own && onSelect(own.id));
-    group.dataset.id = own?.id ?? "";
-    svg.append(group);
-  }
-  graph.edges.forEach((edge) => svg.append(edgePath(px, byId, edge)));
-  for (const node of graph.nodes.filter((n) => n.leaf)) {
-    const [cx, cy] = px(node.x, node.y);
-    const rect = [cx - LAYOUT.nodeW / 2, cy - LAYOUT.nodeH / 2, LAYOUT.nodeW, LAYOUT.nodeH];
-    const group = labelledRect("node", rect, node.name, () => onSelect(node.id));
-    group.dataset.id = node.id;
-    group.classList.toggle("empty", !node.file);
-    svg.append(group);
-  }
 }
 
 /**
@@ -263,6 +205,27 @@ async function modeColors(view, mode) {
 }
 
 /**
+ * Return the colors of one paint, or null when a newer selection or paint replaced it.
+ *
+ * @param {object} view View the paint draws.
+ * @param {string} chosen Mode chosen in the mode select.
+ * @param {number} serial Paint number of this paint on the view.
+ * @returns {Promise<{mode: string, colors: Uint8Array}|null>} The mode drawn and its colors.
+ */
+async function currentColors(view, chosen, serial) {
+  const stale = () => view !== app.current || serial !== view.paints;
+  try {
+    const drawn = await modeColors(view, chosen);
+    return stale() ? null : drawn;
+  } catch (error) {
+    // A newer view owns the status line, so a replaced paint's failure is only logged.
+    if (!stale()) throw error;
+    console.warn("Dropped the failure of a replaced paint:", error);
+    return null;
+  }
+}
+
+/**
  * Render a layer with the view its kind selects, replacing the previous view.
  *
  * @param {object} view Current view with node, record, state and handle.
@@ -280,6 +243,18 @@ function renderView(view, mode, colors) {
 }
 
 /**
+ * Recolor a view on its own canvas and set its legend, keeping the camera and slab.
+ *
+ * @param {object} view Current view whose handle has setColors.
+ * @param {string} mode Color mode drawn.
+ * @param {Uint8Array} colors N*3 colors.
+ */
+function recolorView(view, mode, colors) {
+  view.state.mode = mode;
+  view.handle.setColors(colors, legend(mode));
+}
+
+/**
  * Draw the current layer in the chosen color mode, recoloring through the view handle.
  *
  * Nothing is drawn when a newer selection or paint started while colors were loading.
@@ -293,11 +268,11 @@ async function paint() {
     const { ui, click, graph: { meta } } = app;
     return paintCompare(view, { ui, click, labels: meta.labels, renderers: RENDERERS, pick });
   }
-  const serial = ++view.paints;
-  const { mode, colors } = await modeColors(view, chosen);
-  if (view !== app.current || serial !== view.paints) return;
+  const drawn = await currentColors(view, chosen, ++view.paints);
+  if (!drawn) return;
+  const { mode, colors } = drawn;
   app.ui.status.textContent = mode === chosen ? "" : FALLBACK[chosen];
-  if (view.state.mode === mode && view.handle?.updateColors) view.handle.updateColors(colors);
+  if (view.handle?.setColors) recolorView(view, mode, colors);
   else renderView(view, mode, colors);
   Object.assign(app.ui.view.dataset, { node: view.node.id, mode, channel: app.ui.channel.value });
 }
@@ -344,12 +319,31 @@ export async function showLayer(nodeId) {
   fillChannels(node);
   clearView(node.file ? "Loading layer" : `No stored data for ${node.name}`);
   if (!node.file) return;
-  const record = await loadLayer(node.file);
-  const records = node.files?.b ? [record, await loadLayer(node.files.b)] : undefined;
+  let loaded;
+  try {
+    loaded = await loadRecords(node);
+  } catch (error) {
+    // A later selection owns the status line, so a stale failure is only logged.
+    if (serial === app.serial) throw error;
+    console.warn(`Dropped the failure of replaced layer ${node.file}:`, error);
+    return;
+  }
   if (serial === app.serial) {
-    app.current = { node, record, records, state: {}, handle: null, paints: 0 };
+    app.current = { node, ...loaded, state: {}, handle: null, paints: 0 };
     await paint();
   }
+}
+
+/**
+ * Load the layer of a node, and for a compare node both pane layers.
+ *
+ * @param {object} node Graph node with a file.
+ * @returns {Promise<{record: object, records: (object[]|undefined)}>} The first pane record,
+ *   and both pane records when the node pairs two files.
+ */
+async function loadRecords(node) {
+  const record = await loadLayer(node.file);
+  return { record, records: node.files?.b ? [record, await loadLayer(node.files.b)] : undefined };
 }
 
 /**

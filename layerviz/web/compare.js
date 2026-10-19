@@ -8,10 +8,9 @@
  *
  * Special Notes:
  * - Each pane computes similarity from its own scores at the position nearest the click.
- * - window.layerviz is a debug hook that tests read the drawn colors and camera from.
  */
 
-import { colorsFrom } from "./colors.js";
+import { colorsFrom, legend } from "./colors.js";
 import { cosineSimilarity, nearestIndex, percentileRank } from "./similarity.js";
 
 const PANES = ["a", "b"];
@@ -19,6 +18,7 @@ const NOTES = {
   similarity: "Showing PCA until a position is clicked",
   channel: "Showing PCA, channels are not compared",
   joint: "Joint colors are off, this pair has no joint fit",
+  dimension: (clicked, layer) => `Showing PCA, clicked in ${clicked}D, this layer is ${layer}D`,
 };
 
 /**
@@ -88,6 +88,28 @@ function paneRoot(root, pane, label) {
 }
 
 /**
+ * Render one pane of a compare layer and pass the camera it filled on to the next pane.
+ *
+ * @param {HTMLElement} wrapper Element holding the panes.
+ * @param {object} record Decoded record of the pane.
+ * @param {number} i Pane index, 0 for pane a and 1 for pane b.
+ * @param {object} state Compare state, as renderCompare describes it.
+ * @returns {object|null} The handle the view returned, or null.
+ * @throws {Error} When the layer kind has no view.
+ */
+function renderPane(wrapper, record, i, state) {
+  const render = state.renderers[record.header.kind];
+  if (!render) throw new Error(`no view draws layer kind ${record.header.kind}`);
+  const paneState = Object.assign(state.paneStates[i], {
+    mode: state.mode, camera: state.camera, onPick: (index) => state.onPick(record, index),
+  });
+  const handle = render(paneRoot(wrapper, PANES[i], state.labels[i]), record,
+    state.colors[i], paneState) ?? null;
+  state.camera = paneState.camera;
+  return handle;
+}
+
+/**
  * Render two panes side by side, sharing one camera and one pick callback.
  *
  * @param {HTMLElement} root Element to render into, cleared first.
@@ -96,30 +118,28 @@ function paneRoot(root, pane, label) {
  * @param {object} state Compare state: labels, mode, colors per pane, renderers by layer kind,
  *   onPick(record, positionIndex), and paneStates kept across renders. state.camera is filled
  *   by the first 3D pane and passed to the second.
- * @returns {{updateColors: function(Uint8Array[]): boolean, dispose: function(): void}} A handle
- *   that recolors both panes in place when their views allow it, and one that stops them.
- * @throws {Error} When the layer kind has no view.
+ * @returns {{setColors: function(Uint8Array[], string): boolean, dispose: function(): void}} A
+ *   handle that recolors both panes in place and sets their legend caption when their views
+ *   allow it, and one that stops them.
+ * @throws {Error} When the layer kind has no view or a view throws. Pane a is disposed first.
  */
 export function renderCompare(root, recordA, recordB, state) {
   const wrapper = Object.assign(document.createElement("div"), { className: "layerviz-compare" });
   Object.assign(wrapper.style, { display: "flex", gap: "12px" });
   root.replaceChildren(wrapper);
   state.paneStates ??= [{}, {}];
-  const handles = [recordA, recordB].map((record, i) => {
-    const render = state.renderers[record.header.kind];
-    if (!render) throw new Error(`no view draws layer kind ${record.header.kind}`);
-    const paneState = Object.assign(state.paneStates[i], {
-      mode: state.mode, camera: state.camera, onPick: (index) => state.onPick(record, index),
-    });
-    const handle = render(paneRoot(wrapper, PANES[i], state.labels[i]), record,
-      state.colors[i], paneState) ?? null;
-    state.camera = paneState.camera;
-    return handle;
-  });
+  const handles = [];
+  try {
+    [recordA, recordB].forEach((record, i) => handles.push(renderPane(wrapper, record, i, state)));
+  } catch (error) {
+    // Pane a may hold a WebGL context or listeners that nothing else would release.
+    handles.forEach((handle) => handle?.dispose?.());
+    throw error;
+  }
   return {
-    updateColors(colors) {
-      if (!handles.every((handle) => handle?.updateColors)) return false;
-      handles.forEach((handle, i) => handle.updateColors(colors[i]));
+    setColors(colors, caption) {
+      if (!handles.every((handle) => handle?.setColors)) return false;
+      handles.forEach((handle, i) => handle.setColors(colors[i], caption));
       return true;
     },
     dispose() { handles.forEach((handle) => handle?.dispose?.()); },
@@ -157,18 +177,19 @@ function gateJoint(select, joint) {
 }
 
 /**
- * Point the window.layerviz debug hook at the compare state just drawn.
+ * Pick the status note that says why the drawn mode differs from the chosen one.
  *
- * The hook returns one pane's colors as a plain array, and the camera position one pane
- * renders through, or null for a 2D pane. Panes are indexed 0 and 1.
- *
- * @param {object} state Compare state with colors and paneStates.
+ * @param {object} context Fields forced (a joint choice moved to PCA), chosen (mode select
+ *   value), mode (mode drawn), click (input coordinate or null), and dim (layer dimension).
+ * @returns {string} The note, empty when the chosen mode was drawn.
  */
-function exposeHook(state) {
-  window.layerviz = {
-    colors: (pane) => Array.from(state.colors[pane]),
-    camera: (pane) => state.paneStates[pane].camera?.position.toArray() ?? null,
-  };
+export function compareNote({ forced, chosen, mode, click, dim }) {
+  if (forced) return NOTES.joint;
+  if (mode === chosen) return "";
+  if (chosen === "similarity" && click && click.length !== dim) {
+    return NOTES.dimension(click.length, dim);
+  }
+  return NOTES[chosen] ?? "";
 }
 
 /**
@@ -185,15 +206,15 @@ export function paintCompare(view, env) {
   const chosen = env.ui.mode.value;
   const { mode, colors } = compareColors(records, chosen, env.click, joint);
   view.state.colors = colors;
-  const sameMode = view.state.mode === mode && view.handle?.updateColors(colors);
+  const sameMode = view.state.mode === mode && view.handle?.setColors(colors, legend(mode));
   if (!sameMode) {
     view.handle?.dispose?.();
     Object.assign(view.state, { mode, labels: env.labels, renderers: env.renderers,
       onPick: env.pick });
     view.handle = renderCompare(env.ui.view, records[0], records[1], view.state);
   }
-  env.ui.status.textContent = forced ? NOTES.joint : mode === chosen ? "" : NOTES[chosen] ?? "";
+  env.ui.status.textContent = compareNote({ forced, chosen, mode, click: env.click,
+    dim: records[0].header.dim });
   showCka(env.ui.stats, node);
-  exposeHook(view.state);
   Object.assign(env.ui.view.dataset, { node: node.id, mode, channel: env.ui.channel.value });
 }
