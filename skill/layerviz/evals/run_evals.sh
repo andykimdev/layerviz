@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Run each layerviz skill scenario on Sonnet and Opus with claude -p and save the transcripts.
+# Run each layerviz skill scenario on Haiku, Sonnet, and Opus with claude -p and check its bundles.
 #
 # Usage: skill/layerviz/evals/run_evals.sh [scenario ...]
 # Scenarios default to cnn_2d, spconv_remote, and training_snapshots.
 # Each run gets a fresh temp project holding only the skill and the scenario's Setup files,
 # so no CLAUDE.md from this repo leaks in. Transcripts and the final project land in
 # evals/runs/<stamp>/<scenario>-<model>/. Grade each against its Expected outcome checklist.
+# check_bundle.py output for each run goes to check.txt in that folder, and one pass or fail
+# line per scenario and model goes to evals/runs/<stamp>/summary.txt.
 # After each run, any layerviz serve process left in the temp project is stopped and the
 # temp project is removed. The copy under evals/runs/ stays.
 #
@@ -22,13 +24,14 @@ LAYERVIZ_REPO="${LAYERVIZ_REPO:-$(cd "$SKILL_DIR/../.." && pwd)}"
 PYTHON="${PYTHON:-$LAYERVIZ_REPO/.venv/bin/python}"
 CLAUDE_FLAGS="${CLAUDE_FLAGS:---permission-mode acceptEdits --allowedTools Bash(python:*) Bash(pip:*) Bash(ls:*)}"
 read -r -a EXTRA_FLAGS <<< "$CLAUDE_FLAGS"
-MODELS=(sonnet opus)
+MODELS=(haiku sonnet opus)
 if [ "$#" -gt 0 ]; then
   SCENARIOS=("$@")
 else
   SCENARIOS=(cnn_2d spconv_remote training_snapshots)
 fi
 STAMP="$(date +%Y%m%d-%H%M%S)"
+SUMMARY="$EVALS_DIR/runs/$STAMP/summary.txt"
 export PATH="$(dirname "$PYTHON"):$PATH"
 
 # Print the lines under the heading "## $2" of file $1, up to the next level two heading.
@@ -74,7 +77,35 @@ remove_project() {
 CURRENT_WORK=""
 trap 'remove_project "$CURRENT_WORK"' EXIT
 
-# Run one scenario on one model and save its transcript and final project.
+# Print each bundle folder under $1: a folder with graph.json or an index.html embedding the graph.
+# The skill copy under .claude is skipped, and a snapshot index page with no graph is not a bundle.
+find_bundles() {
+  local root="$1" file
+  find "$root" -path "$root/.claude" -prune -o \( -name graph.json -o -name index.html \) -print |
+    while IFS= read -r file; do
+      if [ "${file##*/}" = graph.json ] || grep -q 'id="graph"' "$file"; then
+        dirname "$file"
+      fi
+    done | sort -u
+}
+
+# Check every bundle of run folder $1 for scenario $2 on model $3 and append its summary line.
+grade_run() {
+  local run="$1" scenario="$2" model="$3" bundle verdict=pass
+  local bundles=()
+  while IFS= read -r bundle; do
+    bundles+=("$bundle")
+  done < <(find_bundles "$run/project")
+  if [ "${#bundles[@]}" -eq 0 ]; then
+    echo "no bundle found under $run/project" > "$run/check.txt"
+    verdict=fail
+  elif ! "$PYTHON" "$SKILL_DIR/check_bundle.py" "${bundles[@]}" > "$run/check.txt" 2>&1; then
+    verdict=fail
+  fi
+  printf '%s %s %s\n' "$verdict" "$scenario" "$model" >> "$SUMMARY"
+}
+
+# Run one scenario on one model, save its transcript and final project, and grade its bundles.
 run_one() {
   local scenario="$1" model="$2" file run work prompt
   file="$EVALS_DIR/$scenario.md"
@@ -88,6 +119,7 @@ run_one() {
   (cd "$work" && claude -p "$prompt" --model "$model" --output-format stream-json --verbose \
     "${EXTRA_FLAGS[@]}") > "$run/transcript.jsonl" || echo "claude exited non zero for $scenario on $model"
   cp -R "$work" "$run/project"
+  grade_run "$run" "$scenario" "$model"
   remove_project "$work"
   CURRENT_WORK=""
 }
@@ -98,3 +130,4 @@ for scenario in "${SCENARIOS[@]}"; do
   done
 done
 echo "transcripts in $EVALS_DIR/runs/$STAMP"
+cat "$SUMMARY"

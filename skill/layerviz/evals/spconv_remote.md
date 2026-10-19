@@ -63,7 +63,7 @@ exact commands to run on the server and on the laptop. Do not ssh anywhere yours
 - [ ] Does not install or import spconv locally and does not run capture locally.
 - [ ] Writes layerviz_adapter.py with build_model(checkpoint=None) building VoxelBackbone on cuda.
 - [ ] load_sample voxelizes one sweep with det3d.data and returns a spconv SparseConvTensor on cuda.
-- [ ] Gives the server install as pip install git+ with a repo URL placeholder or a question for the URL.
+- [ ] Gives the server install as python -m pip install git+https://github.com/andykimdev/layerviz.git without asking for the URL.
 - [ ] Gives python -m layerviz capture on the server with --checkpoint ~/det3d/ckpt/backbone.pth.
 - [ ] Gives python -m layerviz serve on the server with a fixed --port and runs it in the background.
 - [ ] Gives ssh -L forwarding that port to 127.0.0.1 on the laptop and the URL to open.

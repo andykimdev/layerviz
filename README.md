@@ -6,7 +6,7 @@ page opens. It handles dense 2D layers and sparse 3D layers such as spconv.
 
 ## Install
 
-layerviz needs Python 3.10 or newer and torch 2.1 or newer.
+layerviz needs Python 3.10 or newer and torch 2.3 or newer.
 
 ```bash
 pip install git+https://github.com/andykimdev/layerviz.git
@@ -63,6 +63,10 @@ layerviz.capture(model, batch, "runs", step=step, every=1000)
 ## Compare two models
 
 ```python
+from pathlib import Path
+
+import layerviz
+
 layerviz.compare(model_a, model_b, batch, Path("bundle"))
 ```
 
@@ -76,7 +80,13 @@ type. The built-in plugins cover dense tensors and spconv.
 ## Claude skill
 
 The folder skill/layerviz holds a skill that guides an assistant through installing layerviz,
-writing a model adapter, capturing and serving a bundle. To use it, link the folder:
+writing a model adapter, capturing and serving a bundle. To use it, create the skills folder:
+
+```bash
+mkdir -p ~/.claude/skills
+```
+
+Then link the skill folder:
 
 ```bash
 ln -s "$(pwd)/skill/layerviz" ~/.claude/skills/layerviz
@@ -84,9 +94,31 @@ ln -s "$(pwd)/skill/layerviz" ~/.claude/skills/layerviz
 
 ## Tests
 
+The page tests need Node and a Chromium browser for Playwright. Install the dev tools, then
+the browser, each in its own step.
+
+```bash
+npm install
+```
+
+```bash
+python -m playwright install chromium
+```
+
+Run the Python tests, then the browser module tests.
+
 ```bash
 python -m pytest -q
+```
+
+```bash
 node --test 'tests/js/**/*.test.js'
+```
+
+Slow tests are marked and run on request.
+
+```bash
+python -m pytest -m slow
 ```
 
 The tests in tests/test_spconv_real.py skip unless spconv is installed.

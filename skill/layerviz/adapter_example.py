@@ -20,7 +20,7 @@ from typing import Optional
 import torch
 from torch import nn
 
-from layerviz.loading import load_state
+from layerviz import load_state
 
 IMAGE_SIZE = 64  # Small enough to capture on a CPU in seconds, large enough to show structure.
 
