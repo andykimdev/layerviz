@@ -1,20 +1,29 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "layerviz"
-version = "0.1.0"
+dynamic = ["version"]
+description = "Show what each layer of a PyTorch model encodes as PCA color maps in a browser"
+readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
 dependencies = [
     "numpy>=1.24",
     "scipy>=1.10",
-    "torch>=2.1",
+    "torch>=2.3",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest", "playwright", "ruff", "pydoclint", "pyright", "import-linter"]
+
+[project.urls]
+Homepage = "https://github.com/andykimdev/layerviz"
+Repository = "https://github.com/andykimdev/layerviz.git"
+
+[tool.setuptools.dynamic]
+version = { attr = "layerviz.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["layerviz*"]
@@ -29,6 +38,7 @@ layerviz = [
 testpaths = ["tests"]
 pythonpath = ["."]
 markers = ["slow: marks tests that take a long time to run"]
+addopts = '-m "not slow"'
 
 [tool.ruff]
 line-length = 100
@@ -76,6 +86,7 @@ convention = "google"
 style = "google"
 arg-type-hints-in-docstring = false
 check-return-types = false
+check-yield-types = false
 skip-checking-short-docstrings = false
 skip-checking-private-functions = true
 skip-checking-raises = true
@@ -93,6 +104,7 @@ venv = ".venv"
 
 [tool.importlinter]
 root_packages = ["layerviz"]
+exclude_type_checking_imports = true
 
 [[tool.importlinter.contracts]]
 name = "Modules import only downward"
@@ -101,16 +113,11 @@ containers = ["layerviz"]
 layers = [
     "__main__",
     "api | comparison | loading",
-    "bundle | snapshots",
+    "bundle | snapshots | graph",
     "pipeline",
     "extract | align",
-    "trace | budget | inline | layout",
-    "reduce | shapes",
-]
-# Known violations. The bug-fix run removes them, so never add a line here.
-ignore_imports = [
-    "layerviz.pipeline -> layerviz.bundle",
-    "layerviz.extract -> layerviz.pipeline",
+    "trace | budget | inline | layout | framing",
+    "reduce | shapes | options",
 ]
 
 [[tool.importlinter.contracts]]
