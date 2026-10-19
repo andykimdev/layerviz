@@ -15,25 +15,23 @@ Special Notes:
   rgb_joint sections hold black placeholders, since the compare format needs the section.
 """
 
+import copy
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, NamedTuple, Optional
+from typing import Any, NamedTuple
 
 import numpy as np
 from torch import nn
 
-from layerviz import __version__
 from layerviz.align import aligned_rgb, joint_rgb, linear_cka
 from layerviz.budget import COMPARE_BYTES_PER_POSITION
 from layerviz.bundle import WEB_DIR, BundleOptions, LayerPayload, write_bundle
-from layerviz.layout import ancestors, layout_graph
+from layerviz.graph import annotate_nodes, graph_body, graph_meta
 from layerviz.pipeline import CaptureOptions, CapturedLayer, PipelineResult, run_pipeline
 from layerviz.reduce import standardize
-from layerviz.trace import INPUT, Trace
 
 MIN_SHARED_ROWS = 2
 NO_SHARED = "no positions shared between the two models"
-
 
 
 class Pair(NamedTuple):
@@ -58,7 +56,7 @@ class CompareOptions:
     labels: tuple[str, str] = ("A", "B")
     capture: CaptureOptions = field(default_factory=CaptureOptions)
     inline_mb: float = 16
-    web_dir: Optional[Path] = None
+    web_dir: Path | None = None
 
     def __post_init__(self) -> None:
         """Raise ValueError when labels does not hold exactly two names."""
@@ -100,7 +98,9 @@ def take_rows(layer: CapturedLayer, rows: np.ndarray) -> LayerPayload:
     """
     data = layer.data
     labels = None if data.labels is None else [data.labels[i] for i in rows]
-    data = replace(data, positions=data.positions[rows], features=data.features[rows], labels=labels)
+    data = replace(
+        data, positions=data.positions[rows], features=data.features[rows], labels=labels
+    )
     reduced = replace(layer.reduced, rgb=layer.reduced.rgb[rows], scores=layer.reduced.scores[rows])
     channels = None if layer.channels is None else (layer.channels[0][rows], layer.channels[1])
     return LayerPayload(data=data, reduced=reduced, channels=channels)
@@ -108,7 +108,7 @@ def take_rows(layer: CapturedLayer, rows: np.ndarray) -> LayerPayload:
 
 def joint_colors(
     z_a: np.ndarray, z_b: np.ndarray, seed: int
-) -> Optional[tuple[np.ndarray, np.ndarray]]:
+) -> tuple[np.ndarray, np.ndarray] | None:
     """
     Fit joint colors of both panes, or return None when the layers differ in width.
 
@@ -128,7 +128,7 @@ def joint_colors(
     return joint_rgb(z_a, z_b, seed=seed)
 
 
-def pair_payloads(layer_a: CapturedLayer, layer_b: CapturedLayer, seed: int) -> Optional[Pair]:
+def pair_payloads(layer_a: CapturedLayer, layer_b: CapturedLayer, seed: int) -> Pair | None:
     """
     Build both panes of one paired layer and their linear CKA over the shared positions.
 
@@ -173,126 +173,42 @@ def unpaired_names(names_a: list[str], names_b: list[str]) -> dict[str, list[str
     }
 
 
-def layout_leaves(trace: Trace) -> list[str]:
+def pair_nodes(
+    by_name: dict[str, dict[str, Any]], layers_a: list[CapturedLayer],
+    layers_b: dict[str, CapturedLayer], seed: int,
+) -> dict[str, list[LayerPayload]]:
     """
-    List the nodes drawn as graph leaves, the input first, in execution order.
+    Fill the pair fields of every layer both models captured and build its two panes.
 
     Args:
-        trace: The traced forward pass of model A.
+        by_name: Model A graph nodes by module name, changed in place.
+        layers_a: Model A captured layers in execution order.
+        layers_b: Model B captured layers by module name.
+        seed: Seed of the joint PCA fits.
 
     Returns:
-        Names of the input and every module with no executed child.
+        Node id to [pane A, pane B] for every pair with at least MIN_SHARED_ROWS shared
+        positions. A pair with fewer gets the NO_SHARED skip reason and no panes.
     """
-    return [node.name for node in trace.nodes if not trace.children.get(node.name)]
-
-
-def leaf_edges(trace: Trace, leaves: list[str]) -> list[tuple[str, str]]:
-    """
-    Project the trace edges onto leaves, a container leaving from its last leaf.
-
-    Args:
-        trace: The traced forward pass of model A.
-        leaves: The leaf names in execution order.
-
-    Returns:
-        Unique (source, target) leaf pairs in trace order. An edge into a container enters
-        its first leaf.
-    """
-    parents = {node.name: node.parent for node in trace.nodes}
-    first: dict[str, str] = {}
-    last: dict[str, str] = {}
-    for leaf in leaves:
-        for container in ancestors(leaf, parents):
-            first.setdefault(container, leaf)
-            last[container] = leaf
-    edges: dict[tuple[str, str], None] = {}
-    for source, target in trace.edges:
-        pair = (last.get(source, source), first.get(target, target))
-        if pair[0] in leaves and pair[1] in leaves:
-            edges[pair] = None
-    return list(edges)
-
-
-def node_id(index: int) -> str:
-    """Return the graph id of the node with the given execution index."""
-    return f"L{index:04d}"
-
-
-def layer_fields(layer: Optional[CapturedLayer]) -> dict[str, Any]:
-    """
-    Describe one model A layer for its graph node, with nulls when it has none.
-
-    Args:
-        layer: The captured layer, or None.
-
-    Returns:
-        Dict with kind, explained padded to 3 floats, retained, and total.
-    """
-    if layer is None:
-        return {"kind": None, "explained": None, "retained": None, "total": None}
-    explained = [float(v) for v in layer.reduced.explained[:3]]
-    return {
-        "kind": layer.data.kind,
-        "explained": explained + [0.0] * (3 - len(explained)),
-        "retained": float(layer.reduced.retained),
-        "total": int(layer.total),
-    }
-
-
-def graph_nodes(result: PipelineResult, points: dict[str, tuple[float, float]]) -> list[dict]:
-    """
-    Build one node per traced module of model A, without pair fields.
-
-    Args:
-        result: Model A pipeline result.
-        points: Name to (x, y) for leaves and box centers for containers.
-
-    Returns:
-        Node dicts in execution order with ids, layer fields, and coordinates.
-    """
-    ids = {node.name: node_id(node.index) for node in result.trace.nodes}
-    layers = {layer.node.name: layer for layer in result.layers}
-    nodes = []
-    for node in result.trace.nodes:
-        entry = {
-            "id": ids[node.name], "name": node.name, "type": node.type, "parent": node.parent,
-            "index": node.index, "leaf": not result.trace.children.get(node.name),
-            "shape": node.output_shape, "kept": None,
-            "shares": ids.get(node.shares), "skipped": result.skipped.get(node.name),
-            "cka": None, **layer_fields(layers.get(node.name)),
-        }
-        if node.name == INPUT and result.input is not None:
-            entry["kind"] = result.input.kind
-        entry["x"], entry["y"] = points.get(node.name, (0.0, 0.0))
-        nodes.append(entry)
-    return nodes
-
-
-def graph_layout(trace: Trace) -> tuple[dict, list[dict], list[tuple[str, str]]]:
-    """
-    Place model A's leaves and boxes and project its edges onto leaves.
-
-    Args:
-        trace: The traced forward pass of model A.
-
-    Returns:
-        (name to (x, y), box dicts outer first, leaf edges by name).
-    """
-    leaves = layout_leaves(trace)
-    edges = leaf_edges(trace, leaves)
-    placed, boxes = layout_graph(leaves, edges, {node.name: node.parent for node in trace.nodes})
-    points = {box.name: ((box.x0 + box.x1) / 2, (box.y0 + box.y1) / 2) for box in boxes}
-    points.update({leaf.name: (leaf.x, leaf.y) for leaf in placed})
-    box_dicts = [
-        {"name": b.name, "x0": b.x0, "y0": b.y0, "x1": b.x1, "y1": b.y1, "depth": b.depth}
-        for b in boxes
-    ]
-    return points, box_dicts, edges
+    payloads = {}
+    for layer in layers_a:
+        name = layer.node.name
+        if name not in layers_b:
+            continue
+        pair = pair_payloads(layer, layers_b[name], seed)
+        node = by_name[name]
+        if pair is None:
+            node["skipped"] = NO_SHARED
+            continue
+        payloads[node["id"]] = [pair.pane_a, pair.pane_b]
+        node.update(cka=pair.cka, total_b=int(layers_b[name].total), joint=pair.joint)
+    return payloads
 
 
 def compare_graph(
-    result_a: PipelineResult, result_b: PipelineResult, labels: tuple[str, str], seed: int
-) -> tuple[dict, dict[str, list[LayerPayload]]]:
+    result_a: PipelineResult, result_b: PipelineResult, labels: tuple[str, str], seed: int,
+    sample_index: int = 0,
+) -> tuple[dict[str, Any], dict[str, list[LayerPayload]]]:
     """
     Build the comparison graph and the two panes of every paired layer.
 
@@ -301,45 +217,32 @@ def compare_graph(
         result_b: Model B pipeline result.
         labels: Display names of model A and model B.
         seed: Seed of the joint PCA fits.
+        sample_index: The sample of the batch that was captured.
 
     Returns:
         (graph.json dict in compare mode, node id to [pane A, pane B]). Paired nodes carry
         cka, total_b, and joint, which is False when the pair has no joint colors.
+
+    Notes:
+        Nodes, boxes, edges, and meta come from layerviz.graph, so they equal the capture
+        graph of model A apart from the pair fields and the labels, mode, and unpaired meta.
     """
-    points, boxes, edges = graph_layout(result_a.trace)
-    nodes = graph_nodes(result_a, points)
-    ids = {node["name"]: node["id"] for node in nodes}
+    body = graph_body(result_a.trace, {layer.node.name: layer for layer in result_a.layers})
+    annotate_nodes(body["nodes"], result_a)
     layers_b = {layer.node.name: layer for layer in result_b.layers}
     unpaired = unpaired_names([layer.node.name for layer in result_a.layers], list(layers_b))
-    by_name = {node["name"]: node for node in nodes}
+    by_name = {node["name"]: node for node in body["nodes"]}
     for name in unpaired["a"]:
         by_name[name]["skipped"] = f"only in {labels[0]}"
-    payloads = {}
-    for layer in result_a.layers:
-        name = layer.node.name
-        pair = pair_payloads(layer, layers_b[name], seed) if name in layers_b else None
-        if name in layers_b and pair is None:
-            by_name[name]["skipped"] = NO_SHARED
-        if pair is not None:
-            payloads[ids[name]] = [pair.pane_a, pair.pane_b]
-            by_name[name].update(
-                cka=pair.cka, total_b=int(layers_b[name].total), joint=pair.joint
-            )
-    meta = {
-        "model": f"{result_a.model_name} vs {result_b.model_name}", "step": None,
-        "sample_index": None, "label": None, "labels": list(labels), "mode": "compare",
-        "version": __version__, "unpaired": unpaired,
-    }
-    graph = {
-        "meta": meta, "input": ids[INPUT], "nodes": nodes, "boxes": boxes,
-        "edges": [[ids[source], ids[target]] for source, target in edges],
-    }
-    return graph, payloads
+    payloads = pair_nodes(by_name, result_a.layers, layers_b, seed)
+    meta = graph_meta(result_a, list(labels), None, None, sample_index)
+    meta["unpaired"] = unpaired
+    return {"meta": meta, **body}, payloads
 
 
 def compare(
     model_a: nn.Module, model_b: nn.Module, batch: Any, out: Path,
-    options: Optional[CompareOptions] = None,
+    options: CompareOptions | None = None,
 ) -> Path:
     """
     Capture two models on one batch and write one bundle of their layers paired by name.
@@ -347,7 +250,7 @@ def compare(
     Args:
         model_a: The model the graph follows.
         model_b: The model compared against it.
-        batch: The input both models run on.
+        batch: The input both models run on. It is left unchanged.
         out: Output folder.
         options: Labels, shared capture options, inline_mb, and web_dir. Defaults when None.
 
@@ -355,19 +258,21 @@ def compare(
         Path of the written index.html.
 
     Notes:
-        Both captures budget COMPARE_BYTES_PER_POSITION, whatever bytes_per_position the
-        capture options hold, since every pane also stores joint RGB. Each pane budgets half
-        of total_mb, so the whole bundle fits total_mb.
+        Each model runs on its own deep copy of batch, so an in place first module of model
+        A cannot change what model B sees. Both captures budget COMPARE_BYTES_PER_POSITION,
+        whatever bytes_per_position the capture options hold, since every pane also stores
+        joint RGB. Each pane budgets half of total_mb, so the whole bundle fits total_mb.
     """
     opts = options or CompareOptions()
     capture = opts.capture
     pane = replace(
         capture, bytes_per_position=COMPARE_BYTES_PER_POSITION, total_mb=capture.total_mb / 2
     )
-    result_a = run_pipeline(model_a, batch, pane)
-    result_b = run_pipeline(model_b, batch, pane)
-    graph, payloads = compare_graph(result_a, result_b, opts.labels, capture.seed)
-    graph["meta"]["sample_index"] = capture.sample_index
+    result_a = run_pipeline(model_a, copy.deepcopy(batch), pane)
+    result_b = run_pipeline(model_b, copy.deepcopy(batch), pane)
+    graph, payloads = compare_graph(
+        result_a, result_b, opts.labels, capture.seed, capture.sample_index
+    )
     # The bundle check measures both panes together against the full total_mb.
     bundle = BundleOptions(capture.layer_mb, capture.total_mb, opts.web_dir or WEB_DIR)
     return write_bundle(Path(out), graph, payloads, opts.inline_mb, bundle)

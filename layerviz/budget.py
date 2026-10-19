@@ -15,34 +15,80 @@ Special Notes:
 
 import hashlib
 import warnings
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
-from typing import Optional
 
 import numpy as np
 
+from layerviz.reduce import SCORE_COUNT
 from layerviz.shapes.base import LayerData
 
-# Each kept position stores 3 float32 coordinates (12 bytes), 3 uint8 rgb values
-# (3 bytes), and 32 float16 scores (64 bytes).
-BYTES_PER_POSITION = 3 * 4 + 3 * 1 + 32 * 2
-# A comparison pane also stores 3 uint8 joint rgb values per position.
-COMPARE_BYTES_PER_POSITION = BYTES_PER_POSITION + 3
+# One int prices every layer alike. A mapping prices each layer by name.
+PositionBytes = int | Mapping[str, int]
 
 MB = 2**20
 
 
-def positions_in(mb: float, bytes_per_position: int = BYTES_PER_POSITION) -> int:
+def position_bytes(dim: int, joint: bool = False) -> int:
+    """
+    Count the bytes one kept position costs in a layer file.
+
+    Args:
+        dim: Coordinates per position, each a 4 byte float32.
+        joint: Whether the position also stores 3 uint8 joint rgb values, as in compare mode.
+
+    Returns:
+        The bytes of the coordinates, 3 uint8 rgb values, SCORE_COUNT float16 scores, and
+        the joint rgb when joint is true.
+    """
+    return dim * 4 + 3 + SCORE_COUNT * 2 + (3 if joint else 0)
+
+
+BYTES_PER_POSITION = position_bytes(3)
+COMPARE_BYTES_PER_POSITION = position_bytes(3, joint=True)
+
+
+def size_of(bytes_per_position: PositionBytes, name: str) -> int:
+    """
+    Look up the bytes one kept position of the named layer costs.
+
+    Args:
+        bytes_per_position: One size for every layer, or a size per layer name.
+        name: Layer name to price.
+
+    Returns:
+        The int itself, or the mapping's value for name.
+
+    Raises:
+        KeyError: When the mapping has no size for name.
+    """
+    if isinstance(bytes_per_position, int):
+        return bytes_per_position
+    if name not in bytes_per_position:
+        raise KeyError(f"bytes_per_position mapping has no size for layer {name!r}")
+    return bytes_per_position[name]
+
+
+def positions_in(mb: float, bytes_per_position: PositionBytes = BYTES_PER_POSITION) -> int:
     """
     Convert a size in megabytes to the number of positions that fit in it.
 
     Args:
         mb: Size in megabytes of 2**20 bytes.
-        bytes_per_position: Bytes one kept position costs, larger in compare mode.
+        bytes_per_position: Bytes one kept position costs, larger in compare mode. A
+            mapping of layer name to size counts positions of its largest size.
 
     Returns:
         The whole number of positions of bytes_per_position bytes that fit.
+
+    Raises:
+        ValueError: When bytes_per_position is an empty mapping.
     """
-    return int(mb * MB) // bytes_per_position
+    if isinstance(bytes_per_position, int):
+        return int(mb * MB) // bytes_per_position
+    if not bytes_per_position:
+        raise ValueError("bytes_per_position is an empty mapping, so it prices no layer")
+    return int(mb * MB) // max(bytes_per_position.values())
 
 
 def water_fill(demand: dict[str, int], budget: int) -> dict[str, int]:
@@ -50,12 +96,13 @@ def water_fill(demand: dict[str, int], budget: int) -> dict[str, int]:
     Share a budget so layers under their even share keep all they ask for.
 
     Args:
-        demand: Positions each layer asks for, already capped per layer.
-        budget: Total positions to share.
+        demand: Amount each layer asks for, in any unit such as positions or bytes,
+            already capped per layer.
+        budget: Total amount to share, in the same unit as demand.
 
     Returns:
-        Positions per layer. Layers under the final share keep their demand and the
-        rest get the share.
+        Amount per layer in that unit. Layers under the final share keep their demand
+        and the rest get the share.
     """
     keep: dict[str, int] = {}
     open_names = sorted(demand)
@@ -90,8 +137,8 @@ def plan_keep(
     counts: dict[str, int],
     layer_mb: float = 16,
     total_mb: float = 1024,
-    bytes_per_position: int = BYTES_PER_POSITION,
-    overhead: Optional[dict[str, int]] = None,
+    bytes_per_position: PositionBytes = BYTES_PER_POSITION,
+    overhead: dict[str, int] | None = None,
 ) -> dict[str, int]:
     """
     Plan how many positions each layer keeps under the per layer and total caps.
@@ -101,7 +148,7 @@ def plan_keep(
         layer_mb: Largest size of one layer in megabytes.
         total_mb: Largest size of all layers together in megabytes.
         bytes_per_position: Bytes one kept position costs, COMPARE_BYTES_PER_POSITION
-            in compare mode.
+            in compare mode. A mapping gives each layer name its own size.
         overhead: Bytes each named layer's file adds beyond its positions, reserved from
             its layer cap. A missing name reserves nothing.
 
@@ -109,26 +156,30 @@ def plan_keep(
         Positions kept per layer, each at most the layer cap and the layer's count, and at
         least 1 for a non empty layer. Empty counts give an empty dict.
 
+    Raises:
+        KeyError: When a bytes_per_position mapping has no size for a non empty layer.
+
     Notes:
-        When total_mb fits fewer positions than there are non empty layers, each non
-        empty layer keeps 1 position, so the total can exceed total_mb, and a
+        Each non empty layer first keeps 1 position, then the bytes left under total_mb
+        are water filled, so a layer with costlier positions keeps fewer. When total_mb
+        is below 1 position per non empty layer, the total can exceed total_mb, and a
         UserWarning names total_mb and the minimum needed in positions and MB.
     """
-    if not counts:
-        return {}
+    # Empty layers keep nothing and cost nothing, so only non empty layers are priced.
+    filled = [name for name, count in counts.items() if count > 0]
+    size = {name: size_of(bytes_per_position, name) for name in filled}
     reserve = overhead or {}
     demand = {
-        name: min(count, layer_cap(layer_mb, reserve.get(name, 0), bytes_per_position))
-        for name, count in counts.items()
+        name: min(counts[name], layer_cap(layer_mb, reserve.get(name, 0), size[name]))
+        for name in filled
     }
-    budget = positions_in(total_mb, bytes_per_position)
-    needed = sum(1 for want in demand.values() if want > 0)
-    if budget < needed:
-        warn_tiny_budget(total_mb, budget, needed, bytes_per_position)
-        keep = {name: min(want, 1) for name, want in demand.items()}
-    else:
-        keep = water_fill(demand, budget)
-    return {name: keep[name] for name in counts}
+    spare = int(total_mb * MB) - sum(size[name] for name in filled)
+    if spare < 0:
+        warn_tiny_budget(total_mb, filled, bytes_per_position)
+    wants = {name: (demand[name] - 1) * size[name] for name in filled}
+    extra = water_fill(wants, max(0, spare))
+    keep = {name: 0 for name in counts}
+    return keep | {name: 1 + extra[name] // size[name] for name in filled}
 
 
 def plan_channel_caps(
@@ -156,18 +207,25 @@ def plan_channel_caps(
 
 
 def warn_tiny_budget(
-    total_mb: float, budget: int, needed: int, bytes_per_position: int = BYTES_PER_POSITION
+    total_mb: float,
+    filled: Sequence[str],
+    bytes_per_position: PositionBytes = BYTES_PER_POSITION,
 ) -> None:
     """
     Warn that the total budget is below 1 position per non empty layer.
 
     Args:
         total_mb: Requested total size in megabytes.
-        budget: Positions that fit in total_mb.
-        needed: Non empty layers, so the minimum positions needed.
-        bytes_per_position: Bytes one kept position costs.
+        filled: Names of the non empty layers, so the minimum positions needed.
+        bytes_per_position: Bytes one kept position costs, one int or a size per layer.
+
+    Notes:
+        With sizes per layer, the positions that fit are counted at the largest size.
     """
-    needed_mb = needed * bytes_per_position / MB
+    sizes = {name: size_of(bytes_per_position, name) for name in filled}
+    budget = positions_in(total_mb, sizes)
+    needed = len(filled)
+    needed_mb = sum(sizes.values()) / MB
     warnings.warn(
         f"total_mb={total_mb:g} MB fits {budget} positions, fewer than the {needed} "
         f"positions ({needed_mb:g} MB) needed for 1 position per layer. Keeping 1 "

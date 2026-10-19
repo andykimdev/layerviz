@@ -13,7 +13,7 @@ Special Notes:
 - Imports dense first, so points always lands ahead of the tokens plugin.
 """
 
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 import torch
@@ -21,17 +21,12 @@ import torch
 from layerviz.shapes import base
 # Imported for its side effect, so tokens is registered before points anchors on it.
 from layerviz.shapes import dense  # noqa: F401
-from layerviz.shapes.base import LayerData, ShapeContext
+from layerviz.shapes.base import LayerData, ShapeContext, to_numpy
 
 _SPARSE_FIELDS = ("features", "indices", "spatial_shape", "batch_size")
 
 
-def _to_numpy(tensor: torch.Tensor) -> np.ndarray:
-    """Return a float32 NumPy copy of a tensor, detached and on the CPU."""
-    return tensor.detach().cpu().float().numpy()
-
-
-def _stride(grid: tuple, input_grid: Optional[tuple]) -> np.ndarray:
+def _stride(grid: tuple, input_grid: tuple | None) -> np.ndarray:
     """
     Return the input cells per layer cell on each axis.
 
@@ -61,11 +56,28 @@ class Sparse3dPlugin:
     name = "sparse3d"
 
     def accepts(self, output: Any, ctx: ShapeContext) -> bool:
-        """Return whether the output has the four sparse tensor attributes."""
+        """
+        Return whether the output has the four sparse tensor attributes.
+
+        Args:
+            output: Module output of any type.
+            ctx: Context of the layer, unused because the attributes decide alone.
+
+        Returns:
+            True when output has features, indices, spatial_shape, and batch_size.
+        """
         return all(hasattr(output, field) for field in _SPARSE_FIELDS)
 
     def tensors(self, output: Any) -> list:
-        """Return the voxel feature tensor."""
+        """
+        Return the voxel feature tensor.
+
+        Args:
+            output: Sparse tensor this plugin accepted.
+
+        Returns:
+            A one item list holding the features tensor [N, C].
+        """
         return [output.features]
 
     def extract(self, output: Any, ctx: ShapeContext) -> LayerData:
@@ -85,7 +97,7 @@ class Sparse3dPlugin:
         rows = output.indices[:, 0] == ctx.sample_index
         voxels = output.indices[rows, 1:].cpu().numpy()
         positions = (voxels * stride + (stride - 1) / 2).astype(np.float32)
-        features = _to_numpy(output.features[rows])
+        features = to_numpy(output.features[rows])
         scale = tuple(float(s) for s in stride)
         return LayerData("sparse3d", positions, features, grid, scale, None)
 
@@ -99,7 +111,16 @@ class PointsPlugin:
     name = "points"
 
     def accepts(self, output: Any, ctx: ShapeContext) -> bool:
-        """Return whether the output is [B, N, C] with N equal to the input point count."""
+        """
+        Return whether the output is [B, N, C] with N equal to the input point count.
+
+        Args:
+            output: Module output of any type.
+            ctx: Context giving the input positions [N, D], or None without points.
+
+        Returns:
+            True when output is a 3D tensor whose second axis matches the point count.
+        """
         return (
             isinstance(output, torch.Tensor)
             and output.dim() == 3
@@ -108,7 +129,15 @@ class PointsPlugin:
         )
 
     def tensors(self, output: Any) -> list:
-        """Return the output tensor itself."""
+        """
+        Return the output tensor itself.
+
+        Args:
+            output: Tensor [B, N, C] this plugin accepted.
+
+        Returns:
+            A one item list holding output.
+        """
         return [output]
 
     def extract(self, output: Any, ctx: ShapeContext) -> LayerData:
@@ -123,11 +152,11 @@ class PointsPlugin:
             LayerData of kind points with the input positions and features [N, C].
         """
         positions = np.asarray(ctx.input_positions, dtype=np.float32)
-        features = _to_numpy(output[ctx.sample_index])
+        features = to_numpy(output[ctx.sample_index])
         return LayerData("points", positions, features, None, None, None)
 
 
-def inherit_positions(features_2d: Any, ancestor: LayerData) -> Optional[LayerData]:
+def inherit_positions(features_2d: Any, ancestor: LayerData) -> LayerData | None:
     """
     Give a plain [N, C] tensor the layout of an ancestor with N rows.
 
@@ -143,7 +172,7 @@ def inherit_positions(features_2d: Any, ancestor: LayerData) -> Optional[LayerDa
         return None
     if features_2d.shape[0] != len(ancestor.positions):
         return None
-    features = _to_numpy(features_2d)
+    features = to_numpy(features_2d)
     return LayerData(
         ancestor.kind, ancestor.positions, features, ancestor.grid, ancestor.scale, None
     )
@@ -156,17 +185,20 @@ def _registered(name: str) -> bool:
 
 def register_defaults() -> None:
     """
-    Register sparse3d at the front and points before tokens, once each.
+    Register points directly before tokens and sparse3d at the end, once each.
 
     Notes:
-        Points goes to the front when tokens is missing, as in a registry that a
-        test has replaced.
+        Points goes to the end when tokens is missing, as in a registry that a test
+        has replaced. Nothing goes to the front, so a plugin a user registered
+        earlier keeps priority.
     """
     if not _registered(PointsPlugin.name):
-        before = "tokens" if _registered("tokens") else None
-        base.register_shape(PointsPlugin(), before=before)
+        if _registered("tokens"):
+            base.register_shape(PointsPlugin(), before="tokens")
+        else:
+            base.append_shape(PointsPlugin())
     if not _registered(Sparse3dPlugin.name):
-        base.register_shape(Sparse3dPlugin())
+        base.append_shape(Sparse3dPlugin())
 
 
 register_defaults()

@@ -49,7 +49,12 @@ def step_dir(out: Path, step: int) -> Path:
 
     Returns:
         out / step_<step padded to six digits>.
+
+    Raises:
+        ValueError: When step is negative, since list_steps never finds such a folder.
     """
+    if step < 0:
+        raise ValueError(f"step must be 0 or more to name a step folder, got step={step}")
     return Path(out) / f"step_{step:06d}"
 
 

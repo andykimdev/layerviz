@@ -13,7 +13,6 @@ Special Notes:
 import base64
 import posixpath
 import re
-from typing import Optional
 
 INLINE_SUFFIXES = (".js", ".css", ".txt")
 IMPORT_RE = re.compile(
@@ -24,9 +23,14 @@ IMPORT_RE = re.compile(
 EXPORT_DECL_RE = re.compile(
     r"^export\s+((?:async\s+)?(?:function\s*\*?|const|let|var|class)\s*([A-Za-z_$][\w$]*))", re.M
 )
-EXPORT_LIST_RE = re.compile(r"\bexport\s*\{([^{}]*)\}\s*;?")
+# The lookahead leaves export { x } from for EXPORT_FROM_RE to reject, not a stray from clause.
+EXPORT_LIST_RE = re.compile(r"\bexport\s*\{([^{}]*)\}(?!\s*from\b)\s*;?")
+EXPORT_FROM_RE = re.compile(r"\bexport\s*(?:\*|\{[^{}]*\})\s*(?:as\s+[\w$]+\s*)?from\b")
 # Browsers end a comment at --> or --!>, so text holding either would leak into the page.
 COMMENT_END_RE = re.compile(r"--!?>")
+# HTML ends a script at </script in any letter case, and <!-- can start an escaped state.
+SCRIPT_END_RE = re.compile(r"</(script)", re.I)
+GRAPH_LT_RE = re.compile(r"<(?=[/!])")
 IDENT = r"[A-Za-z_$][\w$]*"
 
 
@@ -74,7 +78,7 @@ def _module_order(sources: dict) -> list:
     """Order module paths so each follows its imports, vendor first, raising on a cycle."""
     order, visiting = [], set()
 
-    def visit(rel):
+    def visit(rel: str) -> None:
         if rel in order:
             return
         if rel in visiting:
@@ -94,7 +98,7 @@ def _module_var(rel: str) -> str:
     return "__lv_" + re.sub(r"\W", "_", rel)
 
 
-def _import_binding(clause: Optional[str], var: str, rel: str) -> str:
+def _import_binding(clause: str | None, var: str, rel: str) -> str:
     """
     Turn an import clause into a const that reads from a module variable.
 
@@ -119,8 +123,11 @@ def _strip_exports(rel: str, text: str) -> tuple:
     """
     Remove export syntax and return (source, [(public name, local name)]).
 
-    Raises ValueError when an export form this transform does not support remains.
+    Raises ValueError naming the file for an export from clause or any other export form
+    this transform does not support.
     """
+    if EXPORT_FROM_RE.search(text):
+        raise ValueError(f"{rel} re-exports with an export from clause, which cannot inline")
     names = [(match[2], match[2]) for match in EXPORT_DECL_RE.finditer(text)]
     text = EXPORT_DECL_RE.sub(r"\1", text)
     for match in EXPORT_LIST_RE.finditer(text):
@@ -136,12 +143,14 @@ def _strip_exports(rel: str, text: str) -> tuple:
 def _wrap_module(rel: str, sources: dict) -> str:
     """Wrap one module in a function scope and bind its exports to its module variable."""
 
-    def bind(match):
+    def bind(match: re.Match[str]) -> str:
         var = _module_var(_resolve_import(rel, match["spec"], sources))
         return _import_binding(match["clause"], var, rel)
 
     body, names = _strip_exports(rel, IMPORT_RE.sub(bind, sources[rel]))
-    props = ", ".join(public if public == local else f"{public}: {local}" for public, local in names)
+    props = ", ".join(
+        public if public == local else f"{public}: {local}" for public, local in names
+    )
     return f"const {_module_var(rel)} = (() => {{\n{body}\nreturn {{ {props} }};\n}})();\n"
 
 
@@ -175,12 +184,13 @@ def inline_block(graph_json: str, files: dict, web: dict) -> str:
     # Escaping keeps a closing tag inside the JSON or code from ending its element.
     styles = (text.replace("</style", "<\\/style") for text in _texts(web, ".css").values())
     tags += [f"<style>\n{css}</style>" for css in styles]
-    safe_json = graph_json.replace("</", "<\\/")
-    safe_script = script.replace("</script", "<\\/script")
+    safe_json = GRAPH_LT_RE.sub(r"\\u003c", graph_json)
+    safe_script = SCRIPT_END_RE.sub(r"<\\/\1", script).replace("<!--", "<\\!--")
     tags.append(f'<script type="application/json" id="graph">{safe_json}</script>')
     for path, blob in files.items():
         name = posixpath.basename(path).removesuffix(".bin")
         data = base64.b64encode(blob).decode("ascii")
-        tags.append(f'<script type="application/octet-stream" id="{name}" data-path="{path}">{data}</script>')
+        attrs = f'type="application/octet-stream" id="{name}" data-path="{path}"'
+        tags.append(f"<script {attrs}>{data}</script>")
     tags.append(f'<script type="module">\n{safe_script}</script>')
     return "\n".join(tags)

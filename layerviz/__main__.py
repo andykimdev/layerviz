@@ -18,7 +18,6 @@ import functools
 import http.server
 import sys
 from pathlib import Path
-from typing import Optional
 
 RANDOM = "random"
 
@@ -145,7 +144,7 @@ def run_serve(args: argparse.Namespace) -> int:
     return 0
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     """
     Parse argv and run the chosen subcommand.
 

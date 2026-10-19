@@ -17,7 +17,8 @@ from scipy.optimize import linear_sum_assignment
 
 from layerviz.reduce import Reduced, fit_pca, project, rgb_from_scores
 
-VARIANCE_TOL = 1e-12
+# A channel whose std is within a few float32 ulps of its mean holds rounding noise only.
+NOISE_TOL = 4 * float(np.finfo(np.float32).eps)
 
 
 def _unit_columns(scores: np.ndarray) -> np.ndarray:
@@ -136,9 +137,9 @@ def joint_rgb(z_a: np.ndarray, z_b: np.ndarray, seed: int = 0) -> tuple[np.ndarr
     return rgb[: len(z_a)], rgb[len(z_a) :]
 
 
-def _has_variance(gram_norm: float, raw: np.ndarray) -> bool:
-    """Tell whether a centered Gram norm stands above float noise relative to the raw features."""
-    return bool(gram_norm > VARIANCE_TOL * np.sum(raw**2))
+def _has_signal(raw: np.ndarray) -> bool:
+    """Tell whether any channel's std stands above float32 rounding noise around its mean."""
+    return bool(np.any(raw.std(axis=0) > NOISE_TOL * np.abs(raw.mean(axis=0))))
 
 
 def linear_cka(z_a: np.ndarray, z_b: np.ndarray) -> float:
@@ -150,8 +151,8 @@ def linear_cka(z_a: np.ndarray, z_b: np.ndarray) -> float:
         z_b: Features of shape [N, Cb].
 
     Returns:
-        Similarity in 0..1, 1 for features equal up to rotation and scale, and 0 when either
-        side has no variance beyond VARIANCE_TOL of its raw squared norm.
+        Similarity in 0..1, 1 for features equal up to rotation and scale, and 0 when no
+        channel on one side has a std above NOISE_TOL times its absolute mean.
 
     Raises:
         ValueError: When the two feature sets have different row counts.
@@ -160,11 +161,11 @@ def linear_cka(z_a: np.ndarray, z_b: np.ndarray) -> float:
         raise ValueError(f"CKA needs the same rows, got {len(z_a)} and {len(z_b)}")
     raw_a = np.asarray(z_a, dtype=np.float64)
     raw_b = np.asarray(z_b, dtype=np.float64)
+    if not (_has_signal(raw_a) and _has_signal(raw_b)):
+        return 0.0
     x_a = raw_a - raw_a.mean(axis=0)
     x_b = raw_b - raw_b.mean(axis=0)
     norm_a = np.linalg.norm(x_a.T @ x_a)
     norm_b = np.linalg.norm(x_b.T @ x_b)
-    if not (_has_variance(norm_a, raw_a) and _has_variance(norm_b, raw_b)):
-        return 0.0
     cross = np.linalg.norm(x_a.T @ x_b) ** 2
     return float(np.clip(cross / (norm_a * norm_b), 0.0, 1.0))

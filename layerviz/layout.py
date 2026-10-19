@@ -4,7 +4,7 @@ Place architecture graph nodes by rank and draw container boxes around their lea
 Purpose:
 
 - Rank each leaf by its longest path from the input and center every rank on x.
-- Compute one box per container that spans its placed leaves with a depth based margin.
+- Compute one box per container that spans its placed leaves with a height based margin.
 
 Special Notes:
 
@@ -15,7 +15,9 @@ Special Notes:
 
 from dataclasses import dataclass
 
-MARGIN_PER_LEVEL = 0.3
+# Margins stay under half the unit rank spacing, so boxes on neighboring ranks never meet.
+MARGIN_LIMIT = 0.5
+LEAF_CONTAINER_GAP = 0.2
 
 
 @dataclass
@@ -143,6 +145,37 @@ def ancestors(name: str, parents: dict[str, str | None]) -> list[str]:
     return chain
 
 
+def container_heights(containers: list[str], parents: dict[str, str | None]) -> dict[str, int]:
+    """
+    Count the container levels inside each container.
+
+    Args:
+        containers: Container names, closed under taking ancestors.
+        parents: Map from node name to its parent name, or None at the root.
+
+    Returns:
+        Map from container name to its height, 0 for a container that holds only leaves.
+    """
+    heights = dict.fromkeys(containers, 0)
+    for name in containers:
+        for levels_up, container in enumerate(ancestors(name, parents), start=1):
+            heights[container] = max(heights[container], levels_up)
+    return heights
+
+
+def container_margin(height: int) -> float:
+    """
+    Give the box margin for a container with the given number of levels inside it.
+
+    Args:
+        height: Container levels inside the container, 0 when it holds only leaves.
+
+    Returns:
+        The margin, 0.3 at height 0, then 0.4, 0.45, and always under MARGIN_LIMIT.
+    """
+    return MARGIN_LIMIT - LEAF_CONTAINER_GAP * 0.5**height
+
+
 def container_boxes(placed: list[Placed], parents: dict[str, str | None]) -> list[Box]:
     """
     Build one box per container that holds at least one placed leaf.
@@ -155,18 +188,19 @@ def container_boxes(placed: list[Placed], parents: dict[str, str | None]) -> lis
         Boxes sorted outer first, then by the execution order of their first leaf.
 
     Notes:
-        The margin is 0.3 per level from the deepest container up, so outer boxes enclose
-        inner ones.
+        The margin grows with the container levels inside each container, so a parent box
+        encloses its children. Every margin stays under half a rank, so sibling boxes on
+        neighboring ranks never overlap.
     """
     members: dict[str, list[Placed]] = {}
     for leaf in placed:
         for container in ancestors(leaf.name, parents):
             members.setdefault(container, []).append(leaf)
     depths = {name: len(ancestors(name, parents)) for name in members}
-    deepest = max(depths.values(), default=0)
+    heights = container_heights(list(members), parents)
     boxes = []
     for name, leaves in members.items():
-        margin = MARGIN_PER_LEVEL * (deepest - depths[name] + 1)
+        margin = container_margin(heights[name])
         xs = [leaf.x for leaf in leaves]
         ys = [leaf.y for leaf in leaves]
         boxes.append(

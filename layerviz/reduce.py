@@ -17,6 +17,8 @@ from dataclasses import dataclass, replace
 import numpy as np
 
 SKEW_TIE = 1e-6
+STD_FLOOR = 1e-5
+SCORE_COUNT = 32
 
 
 @dataclass(frozen=True)
@@ -57,13 +59,18 @@ def standardize(features: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarra
         Tuple of z [N, C], mean [C], and std [C], all float32.
 
     Notes:
-        A channel with standard deviation 0 becomes all zeros instead of NaN.
+        A channel whose std is at most STD_FLOOR times the larger of its absolute mean
+        and the largest channel std becomes all zeros. The floor covers two cases.
+
+        - Tiny noise around 0, which unit scaling would blow up to a full color share.
+        - float32 rounding noise around a large mean, such as 1000.
     """
     x = np.asarray(features, dtype=np.float64)
     mean = x.mean(axis=0)
     std = x.std(axis=0)
-    safe = np.where(std > 0, std, 1.0)
-    z = np.where(std > 0, (x - mean) / safe, 0.0)
+    varies = std > STD_FLOOR * np.maximum(np.abs(mean), np.max(std, initial=0.0))
+    safe = np.where(varies, std, 1.0)
+    z = np.where(varies, (x - mean) / safe, 0.0)
     return z.astype(np.float32), mean.astype(np.float32), std.astype(np.float32)
 
 
@@ -264,7 +271,21 @@ def _parse_features(features: np.ndarray) -> np.ndarray:
     return x
 
 
-def reduce_layer(features: np.ndarray, k: int = 32, seed: int = 0) -> Reduced:
+def to_float16(scores: np.ndarray) -> np.ndarray:
+    """
+    Clip scores to the float16 range and cast them, so no stored score is inf.
+
+    Args:
+        scores: Array of any shape.
+
+    Returns:
+        float16 array of the same shape, with values beyond 65504 set to 65504.
+    """
+    top = float(np.finfo(np.float16).max)
+    return np.clip(np.asarray(scores), -top, top).astype(np.float16)
+
+
+def reduce_layer(features: np.ndarray, k: int = SCORE_COUNT, seed: int = 0) -> Reduced:
     """
     Reduce one layer's features to RGB, float16 scores, and explained variance.
 
@@ -286,7 +307,7 @@ def reduce_layer(features: np.ndarray, k: int = 32, seed: int = 0) -> Reduced:
     scores = project(z, fit, stored)
     return Reduced(
         rgb=rgb_from_scores(scores),
-        scores=scores.astype(np.float16),
+        scores=to_float16(scores),
         explained=fit.explained,
         retained=float(np.sum(fit.explained[:stored], dtype=np.float64)),
         fit=fit,
@@ -305,11 +326,13 @@ def channel_bytes(features: np.ndarray, cap_bytes: int) -> tuple[np.ndarray, np.
         Tuple of uint8 data [N, C_kept] and the kept channel indices in ascending order.
 
     Raises:
-        ValueError: When features are not 2D.
+        ValueError: When features are not 2D or cap_bytes is negative.
 
     Notes:
         Each channel is scaled from its 1st to 99th percentile onto 0..255.
     """
+    if cap_bytes < 0:
+        raise ValueError(f"cap_bytes must be at least 0, got {cap_bytes}")
     x = _as_2d(features)
     n_rows, n_channels = x.shape
     if n_rows * n_channels <= cap_bytes:

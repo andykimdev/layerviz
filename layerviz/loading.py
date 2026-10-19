@@ -9,24 +9,27 @@ Purpose:
 
 Special Notes:
 
-- Checkpoints load with weights_only=False, so only load checkpoints you trust.
+- Checkpoints and .pt samples load with weights_only=True first. A file that needs full
+  unpickling loads with weights_only=False after a warning, so only load files you trust.
 """
 
 import importlib
 import os
+import pickle
 import sys
+import warnings
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, TypeGuard
 
 import numpy as np
 import torch
 from torch import nn
 
 STATE_KEYS = ("state_dict", "model")
-WRAPPER_PREFIX = "module."
+WRAPPER_PREFIXES = ("module.", "_orig_mod.")
 
 
-def parse_spec(spec: str) -> Callable:
+def parse_spec(spec: str) -> Any:
     """
     Resolve a pkg.mod:attr spec to the object it names.
 
@@ -52,31 +55,49 @@ def parse_spec(spec: str) -> Callable:
     return target
 
 
-def _is_tensor_dict(value: Any) -> bool:
+def _is_tensor_dict(value: Any) -> TypeGuard[dict]:
     """Return True when value is a non empty dict whose values are all tensors."""
     return isinstance(value, dict) and bool(value) and all(
         isinstance(item, torch.Tensor) for item in value.values()
     )
 
 
+def _shared_prefix(state: dict) -> str | None:
+    """Return the wrapper prefix that every key of state starts with, or None."""
+    for prefix in WRAPPER_PREFIXES:
+        if state and all(key.startswith(prefix) for key in state):
+            return prefix
+    return None
+
+
 def _strip_prefix(state: dict) -> dict:
-    """Drop the module. prefix that DistributedDataParallel adds to every key."""
-    return {
-        key[len(WRAPPER_PREFIX):] if key.startswith(WRAPPER_PREFIX) else key: value
-        for key, value in state.items()
-    }
-
-
-def find_state_dict(checkpoint: Any, state_key: Optional[str] = None) -> Optional[dict]:
     """
-    Find the dict of tensors in a loaded checkpoint and strip any module. prefix.
+    Drop the wrapper prefixes that DistributedDataParallel or torch.compile add to every key.
+
+    Notes:
+        A prefix is stripped only when every key starts with it, so a real submodule named
+        module keeps its keys. Stripping repeats while some prefix is shared by every key.
+    """
+    prefix = _shared_prefix(state)
+    while prefix is not None:
+        state = {key[len(prefix):]: value for key, value in state.items()}
+        prefix = _shared_prefix(state)
+    return state
+
+
+def find_state_dict(checkpoint: Any, state_key: str | None = None) -> dict | None:
+    """
+    Find the dict of tensors in a loaded checkpoint and strip its shared wrapper prefixes.
 
     Args:
         checkpoint: The object torch.load returned.
         state_key: Key searched first, before state_dict, model, and the top level.
 
     Returns:
-        The state dict with any module. prefix stripped, or None when no dict of tensors is found.
+        The state dict, or None when no dict of tensors is found.
+
+    Notes:
+        A module. or _orig_mod. prefix is stripped only when every key starts with it.
     """
     if not isinstance(checkpoint, dict):
         return None
@@ -87,7 +108,31 @@ def find_state_dict(checkpoint: Any, state_key: Optional[str] = None) -> Optiona
     return None
 
 
-def load_state(path: Path | str, state_key: Optional[str] = None) -> dict | nn.Module:
+def safe_torch_load(path: Path | str) -> Any:
+    """
+    Load a torch.save file with weights_only=True, falling back to full unpickling.
+
+    Args:
+        path: The file written by torch.save.
+
+    Returns:
+        The loaded object, on the CPU.
+
+    Notes:
+        The fallback emits one UserWarning that names the file, since full unpickling can run
+        arbitrary code from it.
+    """
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except pickle.UnpicklingError:
+        warnings.warn(
+            f"{path} holds objects beyond tensors, loading it with weights_only=False. "
+            "Only load files you trust.", UserWarning, stacklevel=2,
+        )
+        return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def load_state(path: Path | str, state_key: str | None = None) -> dict | nn.Module:
     """
     Load a checkpoint and find its state dict.
 
@@ -96,12 +141,12 @@ def load_state(path: Path | str, state_key: Optional[str] = None) -> dict | nn.M
         state_key: Key searched first for the state dict, before state_dict and model.
 
     Returns:
-        The state dict with any module. prefix stripped, or the saved nn.Module as is.
+        The state dict with its shared wrapper prefixes stripped, or the saved nn.Module as is.
 
     Raises:
         ValueError: When no searched key or the top level holds a dict of tensors.
     """
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    checkpoint = safe_torch_load(path)
     if isinstance(checkpoint, nn.Module):
         return checkpoint
     state = find_state_dict(checkpoint, state_key)
@@ -113,7 +158,7 @@ def load_state(path: Path | str, state_key: Optional[str] = None) -> dict | nn.M
 
 
 def load_model(
-    spec: str, checkpoint: Optional[Path | str] = None, state_key: Optional[str] = None,
+    spec: str, checkpoint: Path | str | None = None, state_key: str | None = None,
     seed: int = 0,
 ) -> nn.Module:
     """
@@ -130,9 +175,13 @@ def load_model(
 
     Raises:
         ValueError: When the checkpoint keys miss or exceed the model's keys.
+
+    Notes:
+        The seed applies inside a forked random state, so the caller's torch RNG is unchanged.
     """
-    torch.manual_seed(seed)
-    model = parse_spec(spec)()
+    with torch.random.fork_rng():
+        torch.manual_seed(seed)
+        model = parse_spec(spec)()
     if checkpoint is not None:
         state = load_state(checkpoint, state_key)
         if isinstance(state, nn.Module):
@@ -169,11 +218,13 @@ def load_sample(spec_or_path: str) -> Any:
     path = Path(spec_or_path)
     suffix = path.suffix.lower()
     if suffix == ".pt":
-        return torch.load(path, map_location="cpu", weights_only=False)
+        return safe_torch_load(path)
     if suffix == ".npy":
         return torch.from_numpy(np.load(path))
     if suffix == ".npz":
         return _load_npz(path)
     if ":" in spec_or_path and not path.exists():
         return parse_spec(spec_or_path)()
-    raise ValueError(f"sample {spec_or_path} is not a module:function spec or a .pt, .npy, .npz file")
+    raise ValueError(
+        f"sample {spec_or_path} is not a module:function spec or a .pt, .npy, .npz file"
+    )

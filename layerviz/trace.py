@@ -8,22 +8,32 @@ Purpose:
 
 Special Notes:
 
-- Tags live in the _layerviz_tags attribute, which works under no_grad and inference_mode.
-- Objects with a features tensor join provenance, so sparse outputs need no spconv import.
-- The tracer keeps no tensor references beyond the outputs stored on its nodes.
+- The tag helpers and the function mode live in layerviz.tags.
+- Nodes store detached clones of outputs, so a later in place op cannot change them.
+- The recorder remembers every tensor it tags and clears exactly those when the trace ends.
 """
 
+import copy
+import weakref
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable
+from typing import Any
 
 import torch
 from torch import nn
-from torch.overrides import TorchFunctionMode
+from torch.utils.hooks import RemovableHandle
+
+from layerviz.tags import (
+    _TagPropagationMode,
+    clear_tags,
+    flatten_tensors,
+    set_tags,
+    tags_of,
+    tensors_in_call,
+)
 
 INPUT = "input"
-TAG_ATTR = "_layerviz_tags"
 
-PlainTensors = Callable[[Any], list]
 Forward = Callable[[nn.Module, Any], Any]
 
 
@@ -40,7 +50,6 @@ class TraceNode:
     index: int
     output: Any = None
     output_shape: list[int] | None = None
-    leaf: bool = True
     shares: str | None = None
 
 
@@ -56,109 +65,76 @@ class Trace:
     children: dict[str, list[str]] = field(default_factory=dict)
 
 
-def flatten_tensors(obj: Any) -> list[torch.Tensor]:
+def snapshot(obj: Any) -> Any:
     """
-    Collect the tensors inside tensors, tuples, lists, dicts, and objects with features.
+    Copy the tensors inside obj, following the same cases as flatten_tensors.
 
     Args:
         obj: Any value a module receives or returns.
 
     Returns:
-        The tensors found, in traversal order. Other values contribute nothing.
+        A copy whose tensors are detached clones. Tuples, lists, and dicts are rebuilt as
+        their plain type. An object with a features tensor gets a copy with cloned
+        features. Any other value is returned as is.
     """
     if isinstance(obj, torch.Tensor):
-        return [obj]
-    if isinstance(obj, (tuple, list)):
-        return [t for item in obj for t in flatten_tensors(item)]
+        return obj.detach().clone()
+    if isinstance(obj, tuple):
+        return tuple(snapshot(item) for item in obj)
+    if isinstance(obj, list):
+        return [snapshot(item) for item in obj]
     if isinstance(obj, dict):
-        return [t for item in obj.values() for t in flatten_tensors(item)]
+        return {key: snapshot(item) for key, item in obj.items()}
     features = getattr(obj, "features", None)
-    return [features] if isinstance(features, torch.Tensor) else []
+    if not isinstance(features, torch.Tensor):
+        return obj
+    return _with_features(obj, features.detach().clone())
 
 
-def tags_of(tensors: Iterable[torch.Tensor]) -> frozenset[str]:
+def _with_features(obj: Any, features: torch.Tensor) -> Any:
     """
-    Return the union of the producer tags carried by the given tensors.
+    Return a shallow copy of obj that holds other features.
 
     Args:
-        tensors: Tensors that may carry a tag attribute.
+        obj: An object with a features tensor, such as a sparse tensor.
+        features: The tensor the copy holds instead.
 
     Returns:
-        The union of their tags, empty when none is tagged.
+        The result of obj.replace_feature when obj has it, since spconv refuses a direct
+        assignment, else a shallow copy with features set.
     """
-    found: frozenset[str] = frozenset()
-    for tensor in tensors:
-        found |= getattr(tensor, TAG_ATTR, frozenset())
-    return found
+    replace = getattr(obj, "replace_feature", None)
+    if callable(replace):
+        return replace(features)
+    copied = copy.copy(obj)
+    copied.features = features
+    return copied
 
 
-def set_tags(tensors: Iterable[torch.Tensor], tags: frozenset[str]) -> None:
+def _shape_of(output: Any) -> list[int] | None:
     """
-    Replace the producer tags on each tensor.
+    Return the shape of the single tensor in output.
 
     Args:
-        tensors: Tensors to tag.
-        tags: The producer names to store.
-    """
-    for tensor in tensors:
-        setattr(tensor, TAG_ATTR, tags)
-
-
-def clear_tags(tensors: Iterable[torch.Tensor]) -> None:
-    """
-    Remove the producer tags from each tensor that carries them.
-
-    Args:
-        tensors: Tensors that may carry a tag attribute.
-    """
-    for tensor in tensors:
-        if hasattr(tensor, TAG_ATTR):
-            delattr(tensor, TAG_ATTR)
-
-
-def tensors_in_call(plain_tensors: PlainTensors, args: tuple, kwargs: dict) -> list:
-    """
-    Collect the tensors in each positional and keyword argument of one call.
-
-    Args:
-        plain_tensors: Callable returning the tensors inside one argument.
-        args: Positional arguments of the call.
-        kwargs: Keyword arguments of the call.
+        output: Any value a module returns.
 
     Returns:
-        The tensors found, positional arguments first.
+        The shape as a list, or None when output holds zero or several tensors.
     """
-    return [t for arg in (*args, *kwargs.values()) for t in plain_tensors(arg)]
-
-
-class _TagPropagationMode(TorchFunctionMode):
-    """
-    Give every tensor result of a torch function the union of its tensor arguments' tags.
-
-    """
-
-    def __init__(self, plain_tensors: PlainTensors):
-        super().__init__()
-        self.plain_tensors = plain_tensors
-
-    def __torch_function__(self, func, types, args=(), kwargs=None):
-        """Run func, then tag its tensor results with the tags of its tensor arguments."""
-        kwargs = kwargs or {}
-        result = func(*args, **kwargs)
-        tags = tags_of(tensors_in_call(self.plain_tensors, args, kwargs))
-        if tags:
-            set_tags(self.plain_tensors(result), tags)
-        return result
-
-
-def _shape_of(output: Any, plain_tensors: PlainTensors) -> list[int] | None:
-    """Return the shape of the single tensor in output, or None when there is not one."""
-    tensors = plain_tensors(output)
+    tensors = flatten_tensors(output)
     return list(tensors[0].shape) if len(tensors) == 1 else None
 
 
 def _parent_name(name: str) -> str | None:
-    """Return the dotted parent path of a module name, or None for the root."""
+    """
+    Return the dotted parent path of a module name.
+
+    Args:
+        name: A module name from named_modules, empty for the root.
+
+    Returns:
+        The parent path, empty for a top level child, or None for the root.
+    """
     return None if name == "" else name.rpartition(".")[0]
 
 
@@ -168,56 +144,104 @@ class _Recorder:
 
     """
 
-    def __init__(self, plain_tensors: PlainTensors):
-        self.plain_tensors = plain_tensors
+    def __init__(self) -> None:
         self.nodes: dict[str, TraceNode] = {}
         self.edges: dict[tuple[str, str], None] = {}
         self.last_child: dict[str, str] = {}
+        self.live_outputs: dict[str, Any] = {}
+        # Weak references, so remembering a tensor never keeps it alive past its last use.
+        self.tagged: list[weakref.ref[torch.Tensor]] = []
+
+    def tag(self, tensors: list[torch.Tensor], tags: frozenset[str]) -> None:
+        """
+        Set tags on the tensors and remember them, so the trace can clear them at the end.
+
+        Args:
+            tensors: Tensors to tag.
+            tags: The producer names to store.
+        """
+        set_tags(tensors, tags)
+        self.tagged.extend(weakref.ref(tensor) for tensor in tensors)
 
     def record_input(self, batch: Any) -> None:
-        """Add the input node and tag the batch tensors as coming from it."""
+        """
+        Add the input node and tag the batch tensors as coming from it.
+
+        Args:
+            batch: The model input.
+        """
         self.nodes[INPUT] = TraceNode(
             name=INPUT,
             type=type(batch).__name__,
             parent=None,
             index=0,
-            output=batch,
-            output_shape=_shape_of(batch, self.plain_tensors),
+            output=snapshot(batch),
+            output_shape=_shape_of(batch),
         )
-        set_tags(self.plain_tensors(batch), frozenset({INPUT}))
+        self.tag(flatten_tensors(batch), frozenset({INPUT}))
 
     def before(self, name: str, module: nn.Module, args: tuple, kwargs: dict) -> None:
-        """Add the module node on its first call and an edge from each input producer."""
+        """
+        Add the module node on its first call and an edge from each input producer.
+
+        Args:
+            name: The module name from named_modules.
+            module: The module being called.
+            args: Positional arguments of the call.
+            kwargs: Keyword arguments of the call.
+        """
         if name not in self.nodes:
             self.nodes[name] = TraceNode(
                 name=name,
                 type=type(module).__name__,
                 parent=_parent_name(name),
                 index=len(self.nodes),
-                leaf=next(module.children(), None) is None,
             )
-        for producer in tags_of(tensors_in_call(self.plain_tensors, args, kwargs)):
+        for producer in tags_of(tensors_in_call(args, kwargs)):
             self.edges[(producer, name)] = None
 
     def after(self, name: str, output: Any) -> None:
-        """Store the output, note a shared child output, and retag the output tensors."""
+        """
+        Store a snapshot of the output, note a shared child output, and retag the output.
+
+        Args:
+            name: The module name from named_modules.
+            output: The live value the module returned.
+        """
         node = self.nodes[name]
-        node.output = output
-        node.output_shape = _shape_of(output, self.plain_tensors)
+        # The clone runs under the tag mode, so it is tagged during the trace and cleared
+        # with the other tagged tensors.
+        node.output = snapshot(output)
+        node.output_shape = _shape_of(output)
         node.shares = self._shared_child(name, output)
-        set_tags(self.plain_tensors(output), frozenset({name}))
+        self.live_outputs[name] = output
+        self.tag(flatten_tensors(output), frozenset({name}))
         if node.parent is not None:
             self.last_child[node.parent] = name
 
     def _shared_child(self, name: str, output: Any) -> str | None:
-        """Return the last executed child when output is that child's output object."""
+        """
+        Return the last executed child when output is that child's live output object.
+
+        Args:
+            name: The module name whose output is checked.
+            output: The live value that module returned.
+
+        Returns:
+            The child name, or None when no child ran or the output is a new object.
+        """
         child = self.last_child.pop(name, None)
-        if child is None or output is None or self.nodes[child].output is not output:
+        if child is None or output is None or self.live_outputs[child] is not output:
             return None
         return child
 
     def to_trace(self) -> Trace:
-        """Return the recorded nodes, edges, and executed module tree."""
+        """
+        Build the trace from the recorded nodes and edges.
+
+        Returns:
+            The nodes in execution order, the edges, and the executed module tree.
+        """
         modules = [n for n in self.nodes.values() if n.name != INPUT]
         children: dict[str, list[str]] = {n.name: [] for n in modules}
         for node in modules:
@@ -226,13 +250,24 @@ class _Recorder:
         return Trace(list(self.nodes.values()), list(self.edges), children)
 
     def clear_all_tags(self) -> None:
-        """Remove tags from the batch and every node output, so no tag outlives the trace."""
-        for node in self.nodes.values():
-            clear_tags(self.plain_tensors(node.output))
+        """Remove the tags from every tagged tensor still alive, so none outlives the trace."""
+        alive = [tensor for tensor in (ref() for ref in self.tagged) if tensor is not None]
+        clear_tags(alive)
+        self.tagged.clear()
+        self.live_outputs.clear()
 
 
-def _register_hooks(model: nn.Module, recorder: _Recorder) -> list:
-    """Attach a forward pre hook and a forward hook to every module and return the handles."""
+def _register_hooks(model: nn.Module, recorder: _Recorder) -> list[RemovableHandle]:
+    """
+    Attach a forward pre hook and a forward hook to every module.
+
+    Args:
+        model: The module whose submodules get hooks.
+        recorder: The recorder the hooks report to.
+
+    Returns:
+        The handles that remove the hooks.
+    """
     handles = []
     for name, module in model.named_modules():
         pre, post = _pre_hook(recorder, name), _post_hook(recorder, name)
@@ -242,34 +277,73 @@ def _register_hooks(model: nn.Module, recorder: _Recorder) -> list:
 
 
 def _pre_hook(recorder: _Recorder, name: str) -> Callable:
-    """Return a forward pre hook that reports the call of module name to the recorder."""
+    """
+    Return a forward pre hook that reports the call of module name to the recorder.
 
-    def hook(module, args, kwargs):
+    Args:
+        recorder: The recorder the hook reports to.
+        name: The module name from named_modules.
+
+    Returns:
+        A hook for register_forward_pre_hook with with_kwargs set.
+    """
+
+    def hook(module: nn.Module, args: tuple, kwargs: dict) -> None:
+        """
+        Report one module call.
+
+        Args:
+            module: The module being called.
+            args: Positional arguments of the call.
+            kwargs: Keyword arguments of the call.
+        """
         recorder.before(name, module, args, kwargs)
 
     return hook
 
 
 def _post_hook(recorder: _Recorder, name: str) -> Callable:
-    """Return a forward hook that reports the output of module name to the recorder."""
+    """
+    Return a forward hook that reports the output of module name to the recorder.
 
-    def hook(module, args, kwargs, output):
+    Args:
+        recorder: The recorder the hook reports to.
+        name: The module name from named_modules.
+
+    Returns:
+        A hook for register_forward_hook with with_kwargs set.
+    """
+
+    def hook(module: nn.Module, args: tuple, kwargs: dict, output: Any) -> None:
+        """
+        Report one module output.
+
+        Args:
+            module: The module that ran, unused here.
+            args: Positional arguments of the call, unused here.
+            kwargs: Keyword arguments of the call, unused here.
+            output: The value the module returned.
+        """
         recorder.after(name, output)
 
     return hook
 
 
 def _call_model(model: nn.Module, batch: Any) -> Any:
-    """Run the model on the batch as a single positional argument."""
+    """
+    Run the model on the batch as a single positional argument.
+
+    Args:
+        model: The module to run.
+        batch: The input.
+
+    Returns:
+        The model output.
+    """
     return model(batch)
 
 
-def trace_forward(
-    model: nn.Module,
-    batch: Any,
-    forward: Forward | None = None,
-    plain_tensors: PlainTensors | None = None,
-) -> Trace:
+def trace_forward(model: nn.Module, batch: Any, forward: Forward | None = None) -> Trace:
     """
     Run one forward pass and record execution order, provenance, the tree, and outputs.
 
@@ -277,26 +351,25 @@ def trace_forward(
         model: The module to trace. Every submodule gets temporary hooks.
         batch: The input. Its tensors are tagged as the input node.
         forward: Callable taking (model, batch) that runs the pass. Defaults to model(batch).
-        plain_tensors: Callable returning the tensors inside one argument or output.
-            Defaults to flatten_tensors.
 
     Returns:
-        A Trace with the input node first and module nodes in call order.
+        A Trace with the input node first and module nodes in call order. Each node output
+        is a detached clone taken when the module returned.
 
     Notes:
-        - Hooks, the function mode, and all tags are removed even when the forward raises.
+        - Hooks, the function mode, and every tag the trace set are removed even when the
+          forward raises.
         - A container retags its output, so downstream edges come from the container,
           not from its last child.
         - A module called more than once is one node that keeps its last output. Its edges
           can form a cycle, such as l2 to act and then act to l2.
     """
     forward = forward or _call_model
-    plain_tensors = plain_tensors or flatten_tensors
-    recorder = _Recorder(plain_tensors)
+    recorder = _Recorder()
     recorder.record_input(batch)
     handles = _register_hooks(model, recorder)
     try:
-        with _TagPropagationMode(plain_tensors):
+        with _TagPropagationMode(recorder.tag):
             forward(model, batch)
     finally:
         for handle in handles:

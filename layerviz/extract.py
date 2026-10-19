@@ -15,7 +15,7 @@ Special Notes:
 from collections import deque
 from dataclasses import replace
 from fnmatch import fnmatch
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -26,7 +26,7 @@ from layerviz.shapes.base import LayerData, ShapeContext, plugin_for
 from layerviz.trace import INPUT, Trace, TraceNode
 
 if TYPE_CHECKING:
-    from layerviz.pipeline import CaptureOptions
+    from layerviz.options import CaptureOptions
 
 INHERITABLE_KINDS = ("sparse3d", "points")
 SPARSE_FIELDS = ("features", "indices", "spatial_shape", "batch_size")
@@ -41,6 +41,44 @@ def _is_point_pair(batch: Any) -> bool:
     )
 
 
+def batch_size_of(batch: Any) -> int | None:
+    """
+    Return the sample count of a dense batch, a sparse batch, or a point pair.
+
+    Args:
+        batch: The model input.
+
+    Returns:
+        The number of samples, or None for an input whose batch axis is unknown.
+    """
+    if isinstance(batch, torch.Tensor):
+        return int(batch.shape[0]) if batch.dim() >= 1 else None
+    if all(hasattr(batch, name) for name in SPARSE_FIELDS):
+        return int(batch.batch_size)
+    if _is_point_pair(batch):
+        return int(batch[0].shape[0])
+    return None
+
+
+def check_sample_index(batch: Any, sample_index: int) -> None:
+    """
+    Reject a sample index that names no sample of the batch.
+
+    Args:
+        batch: The model input.
+        sample_index: The batch sample the layers show.
+
+    Raises:
+        ValueError: When sample_index is negative or not below the batch size.
+    """
+    size = batch_size_of(batch)
+    if size is not None and not 0 <= sample_index < size:
+        raise ValueError(
+            f"sample_index {sample_index} is outside the batch of {size} samples, "
+            f"use 0 to {size - 1}"
+        )
+
+
 def input_context(batch: Any, sample_index: int) -> ShapeContext:
     """
     Build the shape context that describes the model input.
@@ -52,7 +90,11 @@ def input_context(batch: Any, sample_index: int) -> ShapeContext:
     Returns:
         ShapeContext with the input grid of a dense or sparse batch and the input
         positions and row count of a sparse batch or a point pair.
+
+    Raises:
+        ValueError: When sample_index is outside the batch.
     """
+    check_sample_index(batch, sample_index)
     if isinstance(batch, torch.Tensor):
         grid = tuple(batch.shape[2:]) if batch.dim() >= 4 else None
         return ShapeContext(sample_index, grid, None, None)
@@ -67,7 +109,7 @@ def input_context(batch: Any, sample_index: int) -> ShapeContext:
     return ShapeContext(sample_index, None, None, None)
 
 
-def input_layer(batch: Any, ctx: ShapeContext) -> Optional[LayerData]:
+def input_layer(batch: Any, ctx: ShapeContext) -> LayerData | None:
     """
     Return the model input as a layer, using the feats of a point pair.
 
@@ -84,20 +126,47 @@ def input_layer(batch: Any, ctx: ShapeContext) -> Optional[LayerData]:
 
 
 def selected(name: str, opts: "CaptureOptions") -> bool:
-    """Return whether a module name passes the include and exclude patterns."""
+    """
+    Return whether a module name passes the include and exclude patterns.
+
+    Args:
+        name: The dotted module name.
+        opts: The capture options holding the include and exclude patterns.
+
+    Returns:
+        True when the name matches an include pattern, or none are set, and no exclude.
+    """
     if opts.include is not None and not any(fnmatch(name, p) for p in opts.include):
         return False
     return not any(fnmatch(name, p) for p in opts.exclude or [])
 
 
-def shape_override(name: str, shapes: Optional[dict[str, str]]) -> Optional[str]:
-    """Return the plugin name of the first shapes pattern matching the module name."""
+def shape_override(name: str, shapes: dict[str, str] | None) -> str | None:
+    """
+    Return the plugin name of the first shapes pattern matching the module name.
+
+    Args:
+        name: The dotted module name.
+        shapes: Plugin name by module name pattern, or None.
+
+    Returns:
+        The plugin name, or None when no pattern matches.
+    """
     matches = (plugin for pattern, plugin in (shapes or {}).items() if fnmatch(name, pattern))
     return next(matches, None)
 
 
-def sample_rows(output: Any, sample_index: int) -> Optional[torch.Tensor]:
-    """Return the boolean mask of the sample's rows in a sparse output, or None."""
+def sample_rows(output: Any, sample_index: int) -> torch.Tensor | None:
+    """
+    Return the boolean mask of the sample's rows in a sparse output, or None.
+
+    Args:
+        output: A module output, sparse when it has the sparse tensor fields.
+        sample_index: The batch index of the captured sample.
+
+    Returns:
+        A boolean mask over the sparse rows, or None for a non sparse output.
+    """
     is_sparse = all(hasattr(output, field) for field in SPARSE_FIELDS)
     return output.indices[:, 0] == sample_index if is_sparse else None
 
@@ -106,8 +175,8 @@ def nearest_inheritable(
     name: str,
     parents: dict[str, list[str]],
     found: dict[str, LayerData],
-    shares: dict[str, Optional[str]],
-) -> Optional[str]:
+    shares: dict[str, str | None],
+) -> str | None:
     """
     Return the name of the nearest sparse or points ancestor along the edges.
 
@@ -127,8 +196,8 @@ def nearest_inheritable(
             continue
         seen.add(source)
         owner = source
-        while shares.get(owner) is not None:
-            owner = shares[owner]
+        while (child := shares.get(owner)) is not None:
+            owner = child
         layer = found.get(owner)
         if layer is not None and layer.kind in INHERITABLE_KINDS:
             return owner
@@ -146,10 +215,10 @@ def _as_matrix(data: LayerData) -> LayerData:
 def layer_data(
     node: TraceNode,
     ctx: ShapeContext,
-    override: Optional[str],
-    ancestor: Optional[LayerData],
-    rows: Optional[torch.Tensor],
-) -> tuple[Optional[LayerData], Optional[str]]:
+    override: str | None,
+    ancestor: LayerData | None,
+    rows: torch.Tensor | None,
+) -> tuple[LayerData | None, str | None]:
     """
     Turn one module output into a layer, or give the reason no plugin accepts it.
 
@@ -172,12 +241,26 @@ def layer_data(
         plugin = plugin_for(node.output, ctx, override)
         if plugin is None:
             return None, f"no shape plugin accepts {type(node.output).__name__}"
-        data = _as_matrix(plugin.extract(node.output, ctx))
+        try:
+            extracted = plugin.extract(node.output, ctx)
+        except ValueError as error:
+            # A grid whose rank differs from the input grid cannot be placed, so the
+            # run skips that layer with the reason instead of failing.
+            return None, str(error)
+        data = _as_matrix(extracted)
     return data, None
 
 
-def skip_reason(data: LayerData) -> Optional[str]:
-    """Return why an extracted layer is skipped, when it is empty or holds NaN or inf."""
+def skip_reason(data: LayerData) -> str | None:
+    """
+    Return why an extracted layer is skipped, when it is empty or holds NaN or inf.
+
+    Args:
+        data: The extracted layer.
+
+    Returns:
+        The skip reason, or None when the layer is kept.
+    """
     if len(data.positions) == 0:
         return "no positions in this sample"
     bad = bad_values(data.features)
@@ -185,7 +268,7 @@ def skip_reason(data: LayerData) -> Optional[str]:
 
 
 def extract_layers(
-    trace: Trace, ctx: ShapeContext, opts: "CaptureOptions", input_data: Optional[LayerData]
+    trace: Trace, ctx: ShapeContext, opts: "CaptureOptions", input_data: LayerData | None
 ) -> tuple[list[tuple[TraceNode, LayerData]], dict[str, str]]:
     """
     Extract a layer from every selected module in execution order.
@@ -204,7 +287,7 @@ def extract_layers(
     parents: dict[str, list[str]] = {}
     for source, target in trace.edges:
         parents.setdefault(target, []).append(source)
-    shares: dict[str, Optional[str]] = {node.name: node.shares for node in trace.nodes}
+    shares: dict[str, str | None] = {node.name: node.shares for node in trace.nodes}
     rows = {node.name: sample_rows(node.output, opts.sample_index) for node in trace.nodes}
     found = {INPUT: input_data} if input_data is not None else {}
     accepted, skipped = [], {}
@@ -214,8 +297,9 @@ def extract_layers(
         override = shape_override(node.name, opts.shapes)
         is_matrix = isinstance(node.output, torch.Tensor) and node.output.dim() == 2
         source = nearest_inheritable(node.name, parents, found, shares) if is_matrix else None
-        ancestor = found.get(source)
-        data, reason = layer_data(node, ctx, override, ancestor, rows.get(source))
+        ancestor = found.get(source) if source is not None else None
+        ancestor_rows = rows.get(source) if source is not None else None
+        data, reason = layer_data(node, ctx, override, ancestor, ancestor_rows)
         if data is not None:
             found[node.name] = data
             reason = skip_reason(data)

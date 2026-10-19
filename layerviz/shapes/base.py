@@ -6,6 +6,7 @@ Purpose:
 - Describe one captured layer as a LayerData record in input coordinates.
 - Keep the ordered plugin registry and pick the plugin for a module output.
 - Map the cells of a downsampled grid to input coordinates.
+- Copy tensors to float32 NumPy arrays for every plugin.
 
 Special Notes:
 
@@ -13,7 +14,7 @@ Special Notes:
 """
 
 from dataclasses import dataclass
-from typing import Any, Optional, Protocol
+from typing import Any, Protocol
 
 import numpy as np
 import torch
@@ -31,9 +32,9 @@ class LayerData:
     kind: str
     positions: np.ndarray
     features: np.ndarray
-    grid: Optional[tuple]
-    scale: Optional[tuple]
-    labels: Optional[list]
+    grid: tuple | None
+    scale: tuple | None
+    labels: list | None
 
 
 @dataclass
@@ -44,9 +45,9 @@ class ShapeContext:
     """
 
     sample_index: int
-    input_grid: Optional[tuple]
-    input_positions: Optional[np.ndarray]
-    input_rows: Optional[int]
+    input_grid: tuple | None
+    input_positions: np.ndarray | None
+    input_rows: int | None
 
 
 class ShapePlugin(Protocol):
@@ -58,20 +59,64 @@ class ShapePlugin(Protocol):
     name: str
 
     def accepts(self, output: Any, ctx: ShapeContext) -> bool:
-        """Return whether this plugin handles the module output."""
+        """
+        Return whether this plugin handles the module output.
+
+        Args:
+            output: The module output.
+            ctx: The shape context of the current sample.
+
+        Returns:
+            True when this plugin can turn the output into LayerData.
+        """
         ...
 
     def tensors(self, output: Any) -> list:
-        """Return the tensors inside the module output."""
+        """
+        Return the tensors inside the module output.
+
+        Args:
+            output: The module output.
+
+        Returns:
+            The tensors the output holds, in a list.
+        """
         ...
 
     def extract(self, output: Any, ctx: ShapeContext) -> LayerData:
-        """Return the module output as a LayerData record."""
+        """
+        Return the module output as a LayerData record.
+
+        Args:
+            output: The module output.
+            ctx: The shape context of the current sample.
+
+        Returns:
+            The layer in input coordinates.
+        """
         ...
 
 
 # Public so tests can swap in an empty list with monkeypatch.
 REGISTRY: list[ShapePlugin] = []
+
+
+def to_numpy(tensor: torch.Tensor) -> np.ndarray:
+    """
+    Return a float32 NumPy copy of a tensor, detached and on the CPU.
+
+    Args:
+        tensor: Any torch tensor, on any device and of any float dtype.
+
+    Returns:
+        A float32 NumPy array with the same shape and values that shares no memory
+        with the input.
+
+    Notes:
+        The copy guards against later in-place edits of the module output, such as
+        an inplace ReLU that runs after the capture hook fires.
+    """
+    return tensor.detach().to(device="cpu", dtype=torch.float32, copy=True).numpy()
 
 
 def grid_positions(grid: tuple, input_grid: tuple) -> np.ndarray:
@@ -90,7 +135,10 @@ def grid_positions(grid: tuple, input_grid: tuple) -> np.ndarray:
         ValueError: When grid and input_grid have different numbers of axes.
     """
     if len(grid) != len(input_grid):
-        raise ValueError(f"grid {grid} and input_grid {input_grid} differ in rank")
+        raise ValueError(
+            f"grid has {len(grid)} axes, input_grid has {len(input_grid)}, "
+            f"so their ranks differ: grid {grid}, input_grid {input_grid}"
+        )
     stride = np.asarray(input_grid, dtype=np.float64) / np.asarray(grid, dtype=np.float64)
     indices = np.indices(grid).reshape(len(grid), -1).T
     return (indices * stride + (stride - 1) / 2).astype(np.float32)
@@ -109,7 +157,18 @@ def _index_of(name: str) -> int:
     raise KeyError(f"no shape plugin named {name!r}")
 
 
-def register_shape(plugin: ShapePlugin, before: Optional[str] = None) -> None:
+def _require_new_name(plugin: ShapePlugin) -> None:
+    """
+    Check that no registered plugin already uses this plugin's name.
+
+    Raises:
+        ValueError: When a plugin with the same name is already registered.
+    """
+    if any(p.name == plugin.name for p in REGISTRY):
+        raise ValueError(f"a shape plugin named {plugin.name!r} is already registered")
+
+
+def register_shape(plugin: ShapePlugin, before: str | None = None) -> None:
     """
     Add a plugin to the registry, at the front or before a named plugin.
 
@@ -121,10 +180,26 @@ def register_shape(plugin: ShapePlugin, before: Optional[str] = None) -> None:
         ValueError: When a plugin with the same name is already registered.
         KeyError: When before names no registered plugin.
     """
-    if any(p.name == plugin.name for p in REGISTRY):
-        raise ValueError(f"a shape plugin named {plugin.name!r} is already registered")
+    _require_new_name(plugin)
     position = 0 if before is None else _index_of(before)
     REGISTRY.insert(position, plugin)
+
+
+def append_shape(plugin: ShapePlugin) -> None:
+    """
+    Add a plugin to the end of the registry, behind every plugin already registered.
+
+    Args:
+        plugin: The plugin to register.
+
+    Raises:
+        ValueError: When a plugin with the same name is already registered.
+
+    Notes:
+        Built-in defaults use this, so a plugin a user registers earlier keeps priority.
+    """
+    _require_new_name(plugin)
+    REGISTRY.append(plugin)
 
 
 def plugins() -> list[ShapePlugin]:
@@ -137,9 +212,7 @@ def plugins() -> list[ShapePlugin]:
     return list(REGISTRY)
 
 
-def plugin_for(
-    output: Any, ctx: ShapeContext, override: Optional[str] = None
-) -> Optional[ShapePlugin]:
+def plugin_for(output: Any, ctx: ShapeContext, override: str | None = None) -> ShapePlugin | None:
     """
     Return the plugin that should handle a module output.
 

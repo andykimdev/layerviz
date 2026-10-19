@@ -11,9 +11,10 @@ Special Notes:
 - Writes no files. extract.py turns outputs into layers and names the skipped ones.
 """
 
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Iterator, Optional
+from typing import Any
 
 import numpy as np
 import torch
@@ -21,33 +22,15 @@ from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
 from layerviz.budget import (
-    BYTES_PER_POSITION, MB, plan_channel_caps, plan_keep, positions_in, subsample,
+    BYTES_PER_POSITION, MB, plan_channel_caps, plan_keep, position_bytes, positions_in, subsample,
 )
-from layerviz.bundle import channel_overhead, layer_overhead
 from layerviz.extract import extract_layers, input_context, input_layer
-from layerviz.reduce import Reduced, channel_bytes, reduce_layer
+from layerviz.framing import channel_overhead, layer_overhead
+from layerviz.options import CaptureOptions as CaptureOptions
+from layerviz.reduce import SCORE_COUNT, Reduced, channel_bytes, reduce_layer
 from layerviz.shapes import dense, sparse  # noqa: F401  Importing registers the defaults.
 from layerviz.shapes.base import LayerData
 from layerviz.trace import Trace, TraceNode, trace_forward
-
-
-@dataclass
-class CaptureOptions:
-    """
-    Choose the sample, the layers, the plugin overrides, and the size caps of one capture.
-
-    """
-
-    sample_index: int = 0
-    include: Optional[list[str]] = None
-    exclude: Optional[list[str]] = None
-    shapes: Optional[dict[str, str]] = None
-    forward: Optional[Callable[[nn.Module, Any], Any]] = None
-    layer_mb: float = 16
-    total_mb: float = 1024
-    seed: int = 0
-    # Compare mode passes COMPARE_BYTES_PER_POSITION to budget the joint rgb as well.
-    bytes_per_position: int = BYTES_PER_POSITION
 
 
 @dataclass
@@ -62,7 +45,7 @@ class CapturedLayer:
     reduced: Reduced
     total: int
     kept: int
-    channels: Optional[tuple[np.ndarray, np.ndarray]]
+    channels: tuple[np.ndarray, np.ndarray] | None
 
 
 @dataclass
@@ -76,7 +59,7 @@ class PipelineResult:
     layers: list[CapturedLayer]
     skipped: dict[str, str]
     model_name: str
-    input: Optional[LayerData]
+    input: LayerData | None
 
 
 def unwrap(model: nn.Module) -> nn.Module:
@@ -92,10 +75,11 @@ def unwrap(model: nn.Module) -> nn.Module:
     while True:
         if isinstance(model, DistributedDataParallel):
             model = model.module
-        elif isinstance(getattr(model, "_orig_mod", None), nn.Module):
-            model = model._orig_mod
-        else:
+            continue
+        inner = getattr(model, "_orig_mod", None)
+        if not isinstance(inner, nn.Module):
             return model
+        model = inner
 
 
 @contextmanager
@@ -106,8 +90,8 @@ def prepared(model: nn.Module) -> Iterator[nn.Module]:
     Args:
         model: The module to capture, possibly wrapped.
 
-    Returns:
-        A context manager that yields the unwrapped module.
+    Yields:
+        The unwrapped module.
 
     Notes:
         The training flag of every submodule is restored one by one, so mixed modes
@@ -175,21 +159,61 @@ def channel_need(layer: CapturedLayer) -> int:
     return channel_overhead(layer.kept, n_channels) + layer.kept * n_channels
 
 
-def layer_file_bytes(layer: CapturedLayer, overhead: int, joint_bytes: int) -> int:
+def base_position_bytes(opts: CaptureOptions) -> int:
+    """
+    Return the bytes one kept position of 3 coordinates costs under the capture options.
+
+    Args:
+        opts: The capture options, whose bytes_per_position of None means the single mode size.
+
+    Returns:
+        opts.bytes_per_position, or BYTES_PER_POSITION when it is None.
+    """
+    return BYTES_PER_POSITION if opts.bytes_per_position is None else opts.bytes_per_position
+
+
+def layer_position_bytes(data: LayerData, base: int) -> int:
+    """
+    Return the bytes one kept position of a layer costs, priced by its own coordinate count.
+
+    Args:
+        data: The layer whose positions set the coordinate count.
+        base: Bytes one position of 3 coordinates costs, larger in compare mode.
+
+    Returns:
+        base, plus 4 bytes for each coordinate over 3, or minus 4 for each one under 3.
+    """
+    return base + position_bytes(data.positions.shape[1]) - BYTES_PER_POSITION
+
+
+def position_total_mb(total_mb: float, overhead: dict[str, int]) -> float:
+    """
+    Return the megabytes left for positions once every layer file's overhead is reserved.
+
+    Args:
+        total_mb: Largest size of all files together in megabytes.
+        overhead: Bytes each layer file adds beyond its positions, by layer name.
+
+    Returns:
+        total_mb less the summed overheads, at least 0.
+    """
+    return max(0.0, total_mb - sum(overhead.values()) / MB)
+
+
+def layer_file_bytes(layer: CapturedLayer, overhead: int, size: int) -> int:
     """
     Return the most bytes the layer file of a captured layer takes.
 
     Args:
         layer: The subsampled, reduced layer.
         overhead: Bytes its file adds beyond its positions, from layer_overhead.
-        joint_bytes: Extra bytes per position, 3 for the joint rgb in compare mode, else 0.
+        size: Bytes one kept position was priced at, from layer_position_bytes.
 
     Returns:
-        The overhead plus the float32 coordinates, rgb, float16 scores, and joint rgb bytes.
+        The overhead plus size per kept position, less the score columns it does not store.
     """
-    dim = layer.data.positions.shape[1]
-    k = layer.reduced.scores.shape[1]
-    return overhead + layer.kept * (dim * 4 + 3 + k * 2 + joint_bytes)
+    unused_scores = SCORE_COUNT - layer.reduced.scores.shape[1]
+    return overhead + layer.kept * (size - unused_scores * 2)
 
 
 def with_channels(layer: CapturedLayer, cap_bytes: int) -> CapturedLayer:
@@ -223,15 +247,18 @@ def budget_layers(
         One CapturedLayer per accepted layer, in the same order.
 
     Notes:
-        Positions keep priority. The channel files share only the bytes the layer files
-        leave under total_mb, so layer and channel files together stay within it.
+        Each layer is priced by its own coordinate count. Positions keep priority, after
+        the layer file overheads are reserved from total_mb. The channel files share only
+        the bytes the layer files leave, so layer and channel files together stay within it.
     """
     counts = {node.name: len(data.positions) for node, data in accepted}
     overhead = {node.name: layer_overhead(data) for node, data in accepted}
-    keep = plan_keep(counts, opts.layer_mb, opts.total_mb, opts.bytes_per_position, overhead)
+    base = base_position_bytes(opts)
+    size = {node.name: layer_position_bytes(data, base) for node, data in accepted}
+    total_mb = position_total_mb(opts.total_mb, overhead)
+    keep = plan_keep(counts, opts.layer_mb, total_mb, size, overhead)
     layers = [captured_layer(node, data, keep[node.name], opts.seed) for node, data in accepted]
-    joint_bytes = max(0, opts.bytes_per_position - BYTES_PER_POSITION)
-    used = sum(layer_file_bytes(x, overhead[x.node.name], joint_bytes) for x in layers)
+    used = sum(layer_file_bytes(x, overhead[x.node.name], size[x.node.name]) for x in layers)
     need = {layer.node.name: channel_need(layer) for layer in layers}
     caps = plan_channel_caps(need, opts.layer_mb, opts.total_mb, used)
     return [with_channels(layer, caps[layer.node.name]) for layer in layers]
@@ -255,10 +282,10 @@ def run_pipeline(model: nn.Module, batch: Any, opts: CaptureOptions) -> Pipeline
     Notes:
         The model keeps its training and grad modes even when the forward raises.
     """
-    if positions_in(opts.layer_mb, opts.bytes_per_position) < 1:
+    base = base_position_bytes(opts)
+    if positions_in(opts.layer_mb, base) < 1:
         raise ValueError(
-            f"layer_mb={opts.layer_mb} holds no position, use at least "
-            f"{opts.bytes_per_position / MB:.2e} MB"
+            f"layer_mb={opts.layer_mb} holds no position, use at least {base / MB:.2e} MB"
         )
     with prepared(model) as inner:
         trace = trace_forward(inner, batch, opts.forward)
