@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "playwright"]
+dev = ["pytest", "playwright", "ruff", "pydoclint", "pyright", "import-linter"]
 
 [tool.setuptools.packages.find]
 include = ["layerviz*"]
@@ -29,3 +29,92 @@ layerviz = [
 testpaths = ["tests"]
 pythonpath = ["."]
 markers = ["slow: marks tests that take a long time to run"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["layerviz/web/vendor"]
+# Apply the excludes to file paths passed in explicitly too, as the scaffold check does.
+force-exclude = true
+
+[tool.ruff.lint]
+select = [
+    "E", "W", "F",      # style errors, bare except, unused imports and variables
+    "B",                # likely bugs, including mutable default arguments (B006)
+    "A",                # shadowed builtins
+    "C90",              # complexity (C901)
+    "PLR0913",          # too many arguments
+    "PLR0915",          # too many statements, the closest rule to function length
+    "BLE001",           # catching every exception
+    "S110",             # an exception caught and ignored
+    "T201",             # print left in library code
+    "ERA001",           # commented-out code
+    "ANN001", "ANN002", "ANN003", "ANN201",  # type hints on arguments and public returns
+    "D100", "D101", "D102", "D103",  # docstrings on modules, classes, and public functions
+    "D417",             # an Args section that leaves out a parameter
+    "UP",               # syntax for the target Python version
+]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pylint]
+max-args = 5
+max-statements = 50
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ANN", "D102", "D103", "T201", "PLR0915", "F811"]
+"skill/**/*.py" = ["T201"]
+"layerviz/__main__.py" = ["T201"]
+
+[tool.pydoclint]
+# Public functions with parameters need an Args section, and a Returns section when they
+# return a value. Types live in the signature, not the docstring.
+style = "google"
+arg-type-hints-in-docstring = false
+check-return-types = false
+skip-checking-short-docstrings = false
+skip-checking-private-functions = true
+skip-checking-raises = true
+check-class-attributes = false
+show-filenames-in-every-violation-message = true
+exclude = "tests/|layerviz/web/vendor/|\\.venv/"
+
+[tool.pyright]
+include = ["layerviz"]
+exclude = ["layerviz/web/vendor", "**/__pycache__"]
+typeCheckingMode = "basic"
+pythonVersion = "3.10"
+venvPath = "."
+venv = ".venv"
+
+[tool.importlinter]
+root_packages = ["layerviz"]
+
+[[tool.importlinter.contracts]]
+name = "Modules import only downward"
+type = "layers"
+containers = ["layerviz"]
+layers = [
+    "__main__",
+    "api | comparison | loading",
+    "bundle | snapshots",
+    "pipeline",
+    "extract | align",
+    "trace | budget | inline | layout",
+    "reduce | shapes",
+]
+# Known violations. The bug-fix run removes them, so never add a line here.
+ignore_imports = [
+    "layerviz.pipeline -> layerviz.bundle",
+    "layerviz.extract -> layerviz.pipeline",
+]
+
+[[tool.importlinter.contracts]]
+name = "Shape plugins import only downward"
+type = "layers"
+containers = ["layerviz.shapes"]
+layers = ["sparse", "dense", "base"]
