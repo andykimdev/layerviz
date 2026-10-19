@@ -24,25 +24,15 @@ from torch import nn
 
 from layerviz.api import capture
 from layerviz.budget import MB, plan_channel_caps
-from layerviz.bundle import channel_overhead
 from layerviz.comparison import CompareOptions, compare
+from layerviz.framing import channel_overhead
 from layerviz.pipeline import CaptureOptions, captured_layer, with_channels
 from layerviz.shapes.base import LayerData
-from tests.models import as_eval_pair, image2d_model
-from tests.test_bundle import read_frame
+from tests.models import as_eval_pair, image2d_model, make_web, read_frame
 
 TOTAL_MB = 0.5
 # Holds all 2 x 4096 positions with about 400 KB left, short of 1 MB of full channel files.
 SQUEEZE_MB = 1.0
-
-
-def make_web(root):
-    """Write a minimal web folder with the page template and an entry module."""
-    web = root / "web"
-    web.mkdir()
-    (web / "index.html").write_text("<html><body><!-- layerviz:scripts --></body></html>")
-    (web / "app.js").write_text("console.log(1);\n")
-    return web
 
 
 def wide_model(seed: int = 0):
@@ -63,6 +53,25 @@ def captured_nodes(out):
     return [node for node in graph["nodes"] if node["file"]]
 
 
+def channel_files(out):
+    """Return the sorted names of the channel files in a bundle's layers folder."""
+    return sorted(path.name for path in (out / "layers").iterdir() if path.name.endswith(".ch.bin"))
+
+
+def assert_channel_files_match_graph(out, nodes):
+    """Assert each captured node names one written channel file whose header lists its channels."""
+    assert channel_files(out) == sorted(node["channels"].split("/")[-1] for node in nodes)
+    for node in nodes:
+        header, _, _ = read_frame((out / node["channels"]).read_bytes())
+        assert header["channels"] == node["channel_list"] and node["channel_list"]
+
+
+# The smallest caps, to 0.01 MB, at which the wide model keeps every position and writes a
+# channel file for each layer, since positions keep priority over channels.
+CHANNEL_CAPTURE_MB = 0.6
+CHANNEL_COMPARE_MB = 1.24
+
+
 def test_wide_capture_fits_total_mb_counting_channel_files(tmp_path, recwarn):
     model, batch = wide_model()
     out = tmp_path / "out"
@@ -72,9 +81,10 @@ def test_wide_capture_fits_total_mb_counting_channel_files(tmp_path, recwarn):
     assert bundle_bytes(out) <= TOTAL_MB * MB
     assert not [w for w in recwarn if "total_mb" in str(w.message)]
     nodes = captured_nodes(out)
-    # Positions keep priority, so the 3318 kept of 4096 match the cap without channels.
-    assert [node["kept"] for node in nodes] == [3318, 3318]
-    assert [len(node["channel_list"]) for node in nodes] == [3, 3]
+    # Positions keep priority, so 3491 of 4096 fill the cap and no channel file fits.
+    assert [node["kept"] for node in nodes] == [3491, 3491]
+    assert [(node["channels"], node["channel_list"]) for node in nodes] == [(None, None)] * 2
+    assert channel_files(out) == []
 
 
 def test_wide_compare_fits_total_mb_for_the_whole_bundle(tmp_path):
@@ -90,9 +100,37 @@ def test_wide_compare_fits_total_mb_for_the_whole_bundle(tmp_path):
 
     assert bundle_bytes(out) <= TOTAL_MB * MB
     nodes = captured_nodes(out)
-    # Each pane budgets half of total_mb, so 1598 of 4096 positions per layer and pane.
-    assert [(node["kept"], node["kept_b"]) for node in nodes] == [(1598, 1598)] * 2
-    assert [len(node["channel_list"]) for node in nodes] == [3, 3]
+    # Each pane budgets half of total_mb, so 1676 of 4096 positions per layer and pane.
+    assert [(node["kept"], node["kept_b"]) for node in nodes] == [(1676, 1676)] * 2
+    assert [(node["channels"], node["channel_list"]) for node in nodes] == [(None, None)] * 2
+    assert channel_files(out) == []
+
+
+def test_capture_writes_a_channel_file_per_layer_once_every_position_fits(tmp_path):
+    model, batch = wide_model()
+    out = tmp_path / "out"
+
+    capture(model, batch, out, web_dir=make_web(tmp_path), inline_mb=0, total_mb=CHANNEL_CAPTURE_MB)
+
+    assert bundle_bytes(out) <= CHANNEL_CAPTURE_MB * MB
+    nodes = captured_nodes(out)
+    assert [node["kept"] for node in nodes] == [4096, 4096]
+    assert_channel_files_match_graph(out, nodes)
+
+
+def test_compare_writes_a_channel_file_per_layer_once_every_position_fits(tmp_path):
+    model_a, batch = wide_model(0)
+    model_b, _ = wide_model(1)
+    out = tmp_path / "out"
+    capture_opts = CaptureOptions(total_mb=CHANNEL_COMPARE_MB)
+    opts = CompareOptions(inline_mb=0, web_dir=make_web(tmp_path), capture=capture_opts)
+
+    compare(model_a, model_b, batch, out, opts)
+
+    assert bundle_bytes(out) <= CHANNEL_COMPARE_MB * MB
+    nodes = captured_nodes(out)
+    assert [(node["kept"], node["kept_b"]) for node in nodes] == [(4096, 4096)] * 2
+    assert_channel_files_match_graph(out, nodes)
 
 
 def test_squeezed_channel_file_keeps_its_highest_variance_channels(tmp_path):

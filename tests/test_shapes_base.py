@@ -178,6 +178,25 @@ def test_default_kind_by_rank_maps_rank_to_kind(shape, kind):
     assert base.default_kind_by_rank(torch.zeros(shape)) == kind
 
 
+FLOAT_DTYPES = [torch.float16, torch.float32, torch.float64]
+
+
+@pytest.mark.parametrize("dtype", FLOAT_DTYPES)
+def test_to_numpy_returns_float32_array_with_the_same_values(dtype):
+    tensor = torch.arange(6, dtype=dtype).reshape(2, 3).requires_grad_()
+    array = base.to_numpy(tensor)
+    assert isinstance(array, np.ndarray)
+    assert array.dtype == np.float32
+    np.testing.assert_array_equal(array, np.arange(6, dtype=np.float32).reshape(2, 3))
+
+
+@pytest.mark.parametrize("dtype", FLOAT_DTYPES)
+def test_to_numpy_result_does_not_share_memory_with_its_input(dtype):
+    tensor = torch.zeros(2, 3, dtype=dtype)
+    base.to_numpy(tensor)[0, 0] = 7.0
+    assert tensor[0, 0].item() == 0.0
+
+
 def test_default_kind_by_rank_unsupported_rank_raises_value_error():
     with pytest.raises(ValueError, match="rank 1"):
         base.default_kind_by_rank(torch.zeros(4))

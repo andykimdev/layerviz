@@ -14,11 +14,13 @@ import warnings
 import numpy as np
 import pytest
 
+from layerviz import budget, framing, reduce
 from layerviz.budget import (
     BYTES_PER_POSITION,
     COMPARE_BYTES_PER_POSITION,
     grid_key,
     plan_keep,
+    position_bytes,
     positions_in,
     subsample,
 )
@@ -52,8 +54,75 @@ def test_compare_bytes_per_position_adds_three_bytes_of_joint_rgb():
     assert COMPARE_BYTES_PER_POSITION == 82
 
 
+@pytest.mark.parametrize(
+    ("dim", "joint", "expected"),
+    [(3, False, 79), (3, True, 82), (2, False, 75), (2, True, 78), (1, False, 71)],
+)
+def test_position_bytes_counts_coordinates_rgb_scores_and_joint_rgb(dim, joint, expected):
+    assert position_bytes(dim, joint) == expected
+
+
+def test_score_count_is_one_object_across_reduce_budget_and_framing():
+    assert budget.SCORE_COUNT is reduce.SCORE_COUNT
+    assert framing.SCORE_COUNT is reduce.SCORE_COUNT
+
+
+@pytest.mark.parametrize(
+    ("sizes", "total_bytes"),
+    [(79, 3 * 79), ({"a": 75, "b": 79, "c": 100, "empty": 120}, 75 + 79 + 100)],
+)
+def test_plan_keep_total_of_one_position_per_layer_keeps_one_each_without_warning(
+    sizes, total_bytes
+):
+    counts = {"a": 100, "b": 100, "c": 100, "empty": 0}
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        keep = plan_keep(counts, 16, total_bytes / 2**20, sizes)
+    assert keep == {"a": 1, "b": 1, "c": 1, "empty": 0}
+
+
+@pytest.mark.parametrize(
+    ("sizes", "total_bytes"),
+    [(79, 2 * 79), ({"a": 75, "b": 79, "c": 100, "empty": 120}, 75 + 79 + 100 - 1)],
+)
+def test_plan_keep_total_one_position_short_keeps_one_each_and_warns(sizes, total_bytes):
+    counts = {"a": 100, "b": 100, "c": 100, "empty": 0}
+    with pytest.warns(UserWarning, match=r"fewer than the 3 positions"):
+        keep = plan_keep(counts, 16, total_bytes / 2**20, sizes)
+    assert keep == {"a": 1, "b": 1, "c": 1, "empty": 0}
+
+
+def test_plan_keep_size_mapping_gives_the_larger_layer_fewer_positions():
+    # 1 MB less the first position of each layer leaves 1048422 bytes, 524211 per layer.
+    # That is 6989 more positions of 75 bytes and 6635 more of 79 bytes.
+    sizes = {"flat": 75, "deep": 79}
+    keep = plan_keep({"flat": 10**6, "deep": 10**6}, 16, 1, sizes)
+    assert keep == {"flat": 6990, "deep": 6636}
+    assert sum(keep[name] * sizes[name] for name in keep) <= 2**20
+
+
+def test_plan_keep_size_mapping_without_a_non_empty_layer_raises_key_error_naming_it():
+    match = r"bytes_per_position mapping has no size for layer 'missing'"
+    with pytest.raises(KeyError, match=match):
+        plan_keep({"present": 10, "missing": 10}, 16, 1, {"present": 79})
+
+
+def test_plan_keep_size_mapping_without_an_empty_layer_plans_it_at_zero():
+    keep = plan_keep({"present": 10, "empty": 0}, 16, 1, {"present": 79})
+    assert keep == {"present": 10, "empty": 0}
+
+
 def test_positions_in_16_mb_at_compare_bytes_per_position():
     assert positions_in(16, COMPARE_BYTES_PER_POSITION) == 204600
+
+
+def test_positions_in_size_mapping_counts_positions_of_the_largest_size():
+    assert positions_in(1, {"flat": 75, "deep": 79}) == 13273
+
+
+def test_positions_in_empty_size_mapping_raises_value_error():
+    with pytest.raises(ValueError, match="empty mapping"):
+        positions_in(1, {})
 
 
 def test_plan_keep_compare_bytes_per_position_lowers_the_layer_cap():
@@ -113,31 +182,29 @@ def test_plan_keep_tiny_total_keeps_one_position_per_layer_and_warns():
     assert keep == {"a": 1, "b": 1, "c": 1, "d": 1, "e": 1, "empty": 0}
 
 
-def test_plan_keep_budget_with_room_for_every_layer_does_not_warn():
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        keep = plan_keep({"small": 1000, "big1": 50000, "big2": 50000}, 16, 1)
-    assert keep == {"small": 1000, "big1": 6136, "big2": 6136}
-
-
 def test_plan_keep_empty_counts_returns_empty():
     assert plan_keep({}) == {}
 
 
-def test_plan_keep_is_reproducible():
-    counts = {"a": 7, "b": 123456, "c": 99999}
-    assert plan_keep(counts, 2, 3) == plan_keep(dict(counts), 2, 3)
+def test_plan_keep_layer_and_total_caps_give_the_written_out_plan():
+    # 2 MB caps a layer at 26546 positions and 3 MB holds 39819. After a keeps 7, b and c
+    # split the remaining 39812.
+    keep = plan_keep({"a": 7, "b": 123456, "c": 99999}, 2, 3)
+    assert keep == {"a": 7, "b": 19906, "c": 19906}
 
 
 def test_grid_key_holds_kind_grid_and_count():
     assert grid_key(make_layer(10, grid=(2, 5))) == ("voxel", (2, 5), 10)
 
 
-def test_subsample_same_grid_keeps_same_indices():
-    first, idx_a = subsample(make_layer(500), 40)
-    second, idx_b = subsample(make_layer(500), 40)
-    np.testing.assert_array_equal(idx_a, idx_b)
-    np.testing.assert_array_equal(first.positions, second.positions)
+def test_subsample_same_grid_keeps_the_written_out_rows():
+    # Rows drawn by a NumPy generator seeded from sha256 of (0, ('voxel', (4, 4, 4), 20)).
+    first, idx_a = subsample(make_layer(20), 5)
+    second, idx_b = subsample(make_layer(20, labels=["x"]), 5)
+    np.testing.assert_array_equal(idx_a, [9, 10, 12, 13, 14])
+    np.testing.assert_array_equal(idx_b, [9, 10, 12, 13, 14])
+    np.testing.assert_array_equal(first.positions[:, 0], [9, 10, 12, 13, 14])
+    np.testing.assert_array_equal(second.positions[:, 0], [9, 10, 12, 13, 14])
 
 
 def test_subsample_returns_sorted_unique_rows_of_the_layer():

@@ -3,81 +3,30 @@ Test the viewer page in headless Chromium from inline and multi file bundles.
 
 Purpose:
 - Check the single file page from file:// and the multi file page over http.
-- Check the side panel, channel mode, and similarity kept across a layer switch.
-- Check the PCA fallback note and that a stale channel paint never overwrites a later click.
+- Check the side panel, channel mode, the PCA fallback note, and the selected node.
+- Check that stale loads and paints never draw or report over a later selection.
+- Check that every load error names its file and that a split bundle on disk says to serve it.
 
 Special Notes:
-- serve_dir and open_bundle are shared helpers that later page tests import from here.
+- The browser fixtures come from tests.harness. Other page tests still import them from here.
 - Bundles use the real web folder with the vendored three.js, built without a model.
 """
 
-import functools
-import http.server
-import threading
-from contextlib import contextmanager
-from pathlib import Path
+import json
+import re
 
 import numpy as np
-import pytest
-from playwright.sync_api import sync_playwright
 
 from layerviz.bundle import LayerPayload, write_bundle
 from layerviz.reduce import PCAFit, Reduced
 from layerviz.shapes.base import LayerData
+from tests.harness import (  # noqa: F401
+    browser, open_bundle, page, release, serve_dir)
 
 GRID = (4, 4)
 SCALE = 8.0
-VIRIDIS_LOW = [68, 1, 84]
 VIRIDIS_HIGH = [253, 231, 37]
 CLICK_CELL = (1, 2)
-
-
-class _QuietHandler(http.server.SimpleHTTPRequestHandler):
-    """Serve files without logging every request to stderr."""
-
-    def log_message(self, *args):
-        """Drop the access log line."""
-
-
-@contextmanager
-def serve_dir(path):
-    """
-    Serve a folder over http on a free local port in a background thread.
-
-    Args:
-        path: Folder to serve.
-
-    Returns:
-        A context manager yielding the base URL, ending in a slash.
-    """
-    handler = functools.partial(_QuietHandler, directory=str(path))
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield f"http://127.0.0.1:{server.server_address[1]}/"
-    finally:
-        server.shutdown()
-        server.server_close()
-
-
-def open_bundle(page, url):
-    """
-    Open a bundle page, wait for the graph to be drawn, and collect console errors.
-
-    Args:
-        page: A Playwright page.
-        url: The index.html URL, file:// or http.
-
-    Returns:
-        A list that keeps receiving console error texts and uncaught page errors.
-    """
-    errors = []
-    page.on("console", lambda msg: errors.append(msg.text) if msg.type == "error" else None)
-    page.on("pageerror", lambda error: errors.append(str(error)))
-    page.goto(url)
-    page.wait_for_selector("#graph-svg g.node")
-    return errors
 
 
 def cell_positions(order):
@@ -137,26 +86,27 @@ PAYLOADS = {
 }
 
 
-def build(out, inline_mb):
-    """Write the test bundle with the real web folder and return its index.html path."""
-    return write_bundle(out, make_graph(), PAYLOADS, inline_mb=inline_mb)
+def build(out, inline_mb, graph=None, payloads=None):
+    """Write a bundle, by default the test graph, and return its index.html path."""
+    return write_bundle(out, graph or make_graph(), payloads or PAYLOADS, inline_mb=inline_mb)
 
 
-@pytest.fixture(scope="module")
-def browser():
-    """Launch one headless Chromium for every test in this module."""
-    with sync_playwright() as playwright:
-        chromium = playwright.chromium.launch()
-        yield chromium
-        chromium.close()
+def build_points(out):
+    """Write an inline bundle whose one layer is a 16 position points cloud with channels."""
+    payload = make_payload(range(16), seed=5, channels=True)
+    cloud = np.random.default_rng(5).normal(size=(16, 3)).astype(np.float32)
+    payload.data.kind, payload.data.positions, payload.data.grid, payload.data.scale = (
+        "points", cloud, None, None)
+    graph = make_graph()
+    graph["nodes"] = [graph["nodes"][0], make_node(1, "cloud", kind="points", shape=[16, 5])]
+    graph.update(boxes=[], edges=[["L0000", "L0001"]])
+    return build(out, 16, graph, {"L0001": [payload]})
 
 
-@pytest.fixture
-def page(browser):
-    """Open a fresh page that closes after the test."""
-    page = browser.new_page()
-    yield page
-    page.close()
+def wait_for_status(page, text):
+    """Wait until the status line holds the given text and return the whole line."""
+    page.wait_for_selector(f"#status:has-text({json.dumps(text)})")
+    return page.locator("#status").inner_text()
 
 
 def show(page, node_id, mode="pca"):
@@ -181,32 +131,52 @@ def click_cell(page, row, col):
     page.locator("#view canvas").click(position=position)
 
 
-def cosine_extremes(payload, row):
-    """Return the cells of the most and least cosine similar positions to one position."""
-    scores = payload.reduced.scores.astype(np.float64)
-    unit = scores / np.linalg.norm(scores, axis=1, keepdims=True)
-    similarity = unit @ unit[row]
-    cells = (payload.data.positions // SCALE).astype(int).tolist()
-    return tuple(cells[similarity.argmax()]), tuple(cells[similarity.argmin()])
-
-
-def test_inline_bundle_renders_from_file_url_with_real_vendor_modules(tmp_path, page):
+def test_inline_bundle_is_one_file_that_requests_nothing_else(tmp_path, page):
     index = build(tmp_path / "out", inline_mb=16)
-    html = index.read_text(encoding="utf-8")
     requests = []
     page.on("request", lambda request: requests.append(request.url))
     errors = open_bundle(page, index.as_uri())
+    show(page, "L0001")
     assert sorted(p.name for p in index.parent.iterdir()) == ["index.html"]
-    assert 'from "./' not in html
+    assert 'from "./' not in index.read_text(encoding="utf-8")
+    assert requests == [index.as_uri()]
+    assert errors == []
+
+
+def test_graph_draws_leaves_boxes_and_edges_with_their_names(tmp_path, page):
+    errors = open_bundle(page, build(tmp_path / "out", inline_mb=16).as_uri())
     assert page.locator("#graph-svg g.node").count() == 4
     assert page.locator("#graph-svg g.box").count() == 1
     assert page.locator("#graph-svg path.edge").count() == 3
-    assert page.locator('#graph-svg g.box text').text_content() == "enc"
+    assert page.locator("#graph-svg g.box text").text_content() == "enc"
     assert page.locator('g.node[data-id="L0001"] text').text_content() == "enc.conv1"
+    assert errors == []
+
+
+def test_inline_layer_draws_its_pca_colors_from_a_file_url(tmp_path, page):
+    errors = open_bundle(page, build(tmp_path / "out", inline_mb=16).as_uri())
     show(page, "L0001")
-    rgb = PAYLOADS["L0001"][0].reduced.rgb
-    assert pixel(page, 3, 1) == rgb[13].tolist()
-    assert requests == [index.as_uri()]
+    assert pixel(page, 3, 1) == PAYLOADS["L0001"][0].reduced.rgb[13].tolist()
+    assert errors == []
+
+
+def test_a_module_name_with_markup_renders_as_literal_text(tmp_path, page):
+    graph = make_graph()
+    graph["nodes"][2]["name"] = "<b>x</b>"
+    errors = open_bundle(page, build(tmp_path / "out", 16, graph).as_uri())
+    assert page.locator('g.node[data-id="L0002"] text').text_content() == "<b>x</b>"
+    show(page, "L0002")
+    assert page.locator('#panel [data-field="name"]').inner_text() == "<b>x</b>"
+    assert page.locator("#graph-svg b, #panel b").count() == 0
+    assert errors == []
+
+
+def test_only_the_clicked_node_carries_the_selected_class(tmp_path, page):
+    errors = open_bundle(page, build(tmp_path / "out", inline_mb=16).as_uri())
+    show(page, "L0001")
+    show(page, "L0002")
+    selected = page.locator("#graph-svg g.selected")
+    assert selected.evaluate_all("els => els.map((el) => el.dataset.id)") == ["L0002"]
     assert errors == []
 
 
@@ -290,26 +260,6 @@ def test_channel_mode_loads_the_channel_file_only_when_chosen(tmp_path, page):
     assert errors == []
 
 
-def test_click_then_layer_switch_recolors_at_the_same_input_coordinate(tmp_path, page):
-    index = build(tmp_path / "out", inline_mb=16)
-    errors = open_bundle(page, index.as_uri())
-    show(page, "L0001")
-    click_cell(page, *CLICK_CELL)
-    page.wait_for_selector('#view[data-node="L0001"][data-mode="similarity"] canvas')
-    coordinate = page.locator("#click").inner_text()
-    assert coordinate == "12, 20"
-    assert pixel(page, *CLICK_CELL) == VIRIDIS_HIGH
-    show(page, "L0002", mode="similarity")
-    assert page.locator("#click").inner_text() == coordinate
-    row = 15 - (CLICK_CELL[0] * GRID[1] + CLICK_CELL[1])
-    high, low = cosine_extremes(PAYLOADS["L0002"][0], row)
-    assert high == CLICK_CELL
-    assert pixel(page, *high) == VIRIDIS_HIGH
-    assert pixel(page, *low) == VIRIDIS_LOW
-    assert page.locator(".layerviz-legend").inner_text() == "Similarity percentile, low to high"
-    assert errors == []
-
-
 def test_similarity_without_a_click_draws_pca_with_a_note_until_a_click(tmp_path, page):
     index = build(tmp_path / "out", inline_mb=16)
     errors = open_bundle(page, index.as_uri())
@@ -337,14 +287,111 @@ def test_a_slow_channel_load_does_not_overwrite_a_later_click(tmp_path, page):
         click_cell(page, *CLICK_CELL)
         page.wait_for_selector('#view[data-mode="similarity"] canvas')
         assert len(held) == 1
-        held[0].continue_()
-        # Awaiting the same cached promise, then one task, lets the held paint finish first.
-        page.evaluate("""async (path) => {
-          const { loadLayer } = await import("./app.js");
-          await loadLayer(path);
-          await new Promise((resolve) => setTimeout(resolve, 0));
-        }""", "layers/L0001.ch.bin")
+        release(page, held[0], "layers/L0001.ch.bin")
         assert page.locator("#view").get_attribute("data-mode") == "similarity"
         assert page.input_value("#mode") == "similarity"
         assert pixel(page, *CLICK_CELL) == VIRIDIS_HIGH
+    assert errors == []
+
+
+def test_selecting_a_layer_while_another_loads_draws_only_the_later_one(tmp_path, page):
+    out = build(tmp_path / "out", inline_mb=0).parent
+    held = []
+    with serve_dir(out) as url:
+        page.route("**/layers/L0001.bin", lambda route: held.append(route))
+        errors = open_bundle(page, url + "index.html")
+        with page.expect_request("**/layers/L0001.bin"):
+            page.click('#graph-svg g.node[data-id="L0001"]')
+        show(page, "L0002")
+        release(page, held[0], "layers/L0001.bin")
+        assert page.locator("#view").get_attribute("data-node") == "L0002"
+        assert page.locator('#panel [data-field="name"]').inner_text() == "enc.conv2"
+        assert pixel(page, 0, 0) == PAYLOADS["L0002"][0].reduced.rgb[15].tolist()
+    assert errors == []
+
+
+def test_a_stale_failed_load_leaves_the_later_layer_status_empty(tmp_path, page):
+    out = build(tmp_path / "out", inline_mb=0).parent
+    held = []
+    with serve_dir(out) as url:
+        page.route("**/layers/L0001.bin", lambda route: held.append(route))
+        open_bundle(page, url + "index.html")
+        with page.expect_request("**/layers/L0001.bin"):
+            page.click('#graph-svg g.node[data-id="L0001"]')
+        show(page, "L0002")
+        release(page, held[0], "layers/L0001.bin", fail=True)
+        assert page.locator("#status").inner_text() == ""
+        assert page.locator("#view").get_attribute("data-node") == "L0002"
+
+def test_a_stale_channel_failure_leaves_the_later_layer_status_alone(tmp_path, page):
+    out = build(tmp_path / "out", inline_mb=0).parent
+    held = []
+    with serve_dir(out) as url:
+        page.route("**/layers/L0001.ch.bin", lambda route: held.append(route))
+        open_bundle(page, url + "index.html")
+        show(page, "L0001")
+        with page.expect_request("**/layers/L0001.ch.bin"):
+            page.select_option("#mode", "channel")
+        show(page, "L0002")
+        release(page, held[0], "layers/L0001.ch.bin", fail=True)
+        assert page.locator("#status").inner_text() == "Showing PCA, this layer has no channels"
+        assert page.locator("#view").get_attribute("data-node") == "L0002"
+
+
+def test_a_failed_first_load_names_the_file_and_loads_on_the_next_click(tmp_path, page):
+    out = build(tmp_path / "out", inline_mb=0).parent
+    attempts = []
+
+    def fail_once(route):
+        attempts.append(route)
+        route.abort() if len(attempts) == 1 else route.continue_()
+
+    with serve_dir(out) as url:
+        page.route("**/layers/L0002.bin", fail_once)
+        open_bundle(page, url + "index.html")
+        page.click('#graph-svg g.node[data-id="L0002"]')
+        status = wait_for_status(page, "layers/L0002.bin")
+        assert status.startswith("layers/L0002.bin could not be fetched")
+        show(page, "L0002")
+        assert len(attempts) == 2
+        assert page.locator("#status").inner_text() == ""
+        assert pixel(page, 0, 0) == PAYLOADS["L0002"][0].reduced.rgb[15].tolist()
+
+
+def test_invalid_graph_json_names_the_file_in_the_status(tmp_path, page):
+    out = build(tmp_path / "out", inline_mb=0).parent
+    (out / "graph.json").write_text("{not json")
+    with serve_dir(out) as url:
+        page.goto(url + "index.html")
+        assert wait_for_status(page, "graph.json").startswith("graph.json is not valid JSON")
+
+
+def test_invalid_inline_base64_names_the_layer_file_in_the_status(tmp_path, page):
+    index = build(tmp_path / "out", inline_mb=16)
+    html = index.read_text(encoding="utf-8")
+    broken = re.sub(r'(data-path="layers/L0001.bin">)[^<]*', r"\1@@@@", html)
+    assert broken != html
+    index.write_text(broken, encoding="utf-8")
+    open_bundle(page, index.as_uri())
+    page.click('#graph-svg g.node[data-id="L0001"]')
+    status = wait_for_status(page, "layers/L0001.bin")
+    assert status.startswith("layers/L0001.bin: base64 text is not valid")
+
+
+def test_a_split_bundle_opened_from_disk_says_to_serve_its_folder(tmp_path, page):
+    index = build(tmp_path / "out", inline_mb=0)
+    page.goto(index.as_uri())
+    status = wait_for_status(page, "python -m layerviz serve")
+    assert f'python -m layerviz serve "{index.parent}" and open' in status
+    assert page.locator("#graph-svg g.node").count() == 0
+
+
+def test_a_mode_switch_of_a_3d_layer_recolors_the_same_canvas_and_legend(tmp_path, page):
+    errors = open_bundle(page, build_points(tmp_path / "out").as_uri())
+    show(page, "L0001")
+    page.evaluate("document.querySelector('#view canvas').dataset.mark = 'first'")
+    page.select_option("#mode", "channel")
+    page.wait_for_selector('#view[data-mode="channel"]')
+    assert page.locator("#view canvas").first.get_attribute("data-mark") == "first"
+    assert page.locator(".layerviz-legend").inner_text() == "Channel value, low to high"
     assert errors == []

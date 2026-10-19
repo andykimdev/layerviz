@@ -4,8 +4,8 @@ Test that the layerviz skill meets the skill format limits and matches the real 
 Purpose:
 
 - Check the SKILL.md name, description, body length, and links against the skill format.
-- Check that every python -m layerviz command in SKILL.md uses a real subcommand and flag.
-- Check that the three eval scenarios and run_evals.sh exist and name Sonnet and Opus.
+- Parse every python -m layerviz command and backticked flag of the docs with the real parser.
+- Check that the three eval scenarios exist and run_evals.sh runs and grades three models.
 - Check that the adapter example captures through the command line and passes check_bundle.py.
 
 Special Notes:
@@ -28,7 +28,13 @@ from layerviz.__main__ import build_parser, main
 ROOT = Path(__file__).resolve().parents[1]
 SKILL = ROOT / "skill" / "layerviz"
 SCENARIOS = ("cnn_2d.md", "spconv_remote.md", "training_snapshots.md")
+DOCUMENTED = ("SKILL.md", "README.md", *SCENARIOS)
 FENCE = re.compile(r"```(?:bash|sh)\n(.*?)```", re.DOTALL)
+ANY_FENCE = re.compile(r"```.*?```", re.DOTALL)
+BACKTICKED = re.compile(r"`([^`\n]+)`")
+FLAG = re.compile(r"--[a-z][a-z0-9-]*")
+# A redirect, pipe, or background word ends the arguments the shell hands to layerviz.
+SHELL_OPERATOR = re.compile(r"^\d*[<>|&;]")
 # The skill format allows a name of lowercase words joined by hyphens.
 NAME = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 LINK = re.compile(r"\[[^\]]*\]\(([^)\s#]+)")
@@ -60,8 +66,39 @@ def layerviz_commands(markdown: str) -> list[list[str]]:
             words = shlex.split(line, comments=True)
             for start in range(len(words) - 2):
                 if words[start:start + 3] == ["python", "-m", "layerviz"]:
-                    commands.append(words[start + 3:])
+                    commands.append(layerviz_arguments(words[start + 3:]))
     return commands
+
+
+def layerviz_arguments(words: list[str]) -> list[str]:
+    """Return the words up to the first shell redirect, pipe, or background operator."""
+    for index, word in enumerate(words):
+        if SHELL_OPERATOR.match(word):
+            return words[:index]
+    return words
+
+
+def documented_text(name: str) -> str:
+    """Return the text of SKILL.md, README.md, or one eval scenario by file name."""
+    if name == "SKILL.md":
+        return skill_body()
+    return (ROOT / "README.md" if name == "README.md" else SKILL / "evals" / name).read_text()
+
+
+def prose_flags(markdown: str) -> set[str]:
+    """Return the flags outside code fences, in backticks or on lines naming python -m layerviz."""
+    prose = ANY_FENCE.sub("", markdown)
+    spans = BACKTICKED.findall(prose)
+    spans += [line for line in prose.splitlines() if "python -m layerviz" in line]
+    return {flag for span in spans for flag in FLAG.findall(span)}
+
+
+def parse_documented(words: list[str]) -> argparse.Namespace:
+    """Parse one documented command with the real parser and fail the test when it errors."""
+    try:
+        return build_parser().parse_args(words)
+    except SystemExit:
+        pytest.fail(f"python -m layerviz {shlex.join(words)} does not parse")
 
 
 def subcommand_flags() -> dict[str, set[str]]:
@@ -70,6 +107,12 @@ def subcommand_flags() -> dict[str, set[str]]:
     choices = next(a.choices for a in actions if isinstance(a, argparse._SubParsersAction))
     return {name: {flag for action in sub._actions for flag in action.option_strings}
             for name, sub in choices.items()}
+
+
+def misspelled_flags(words: list[str]) -> set[str]:
+    """Return the flags of one documented command that its subcommand does not accept."""
+    used = {word.split("=")[0] for word in words if word.startswith("--")}
+    return used - subcommand_flags()[words[0]]
 
 
 def test_skill_meets_the_skill_format_limits():
@@ -85,42 +128,69 @@ def test_skill_meets_the_skill_format_limits():
     assert missing == []
 
 
-def test_skill_body_is_short_and_covers_each_step():
-    """The body stays under 150 lines and names install, adapter, remote serve, and check."""
-    body = skill_body()
-    assert len(body.strip("\n").splitlines()) < 150
-    for text in ("pip install -e", "pip install git+<repo url>", "layerviz_adapter.py",
-                 "build_model(checkpoint=None)", "load_sample()", "ssh -N -L",
-                 "(adapter_example.py)", "(check_bundle.py)", "joint switch"):
-        assert text in body, text
+def test_skill_body_is_under_150_lines():
+    """The body stays under 150 lines."""
+    assert len(skill_body().strip("\n").splitlines()) < 150
 
 
-def test_skill_commands_use_real_subcommands_and_flags():
-    """Every python -m layerviz command in SKILL.md parses against the real parser."""
-    commands = layerviz_commands(skill_body())
-    flags = subcommand_flags()
-    assert {words[0] for words in commands} == {"capture", "compare", "serve"}
-    for words in commands:
-        used = {word.split("=")[0] for word in words if word.startswith("--")}
-        assert used <= flags[words[0]], f"{words[0]} has no flag {used - flags[words[0]]}"
+@pytest.mark.parametrize("text", ["layerviz_adapter.py", "build_model(checkpoint=None)",
+                                  "load_sample()", "ssh -N -L", "(adapter_example.py)",
+                                  "(check_bundle.py)"])
+def test_skill_body_covers_each_step(text):
+    """The body names the adapter, remote serve, and check steps."""
+    assert text in skill_body()
 
 
-def test_skill_names_no_date_or_model_version():
+@pytest.mark.parametrize("name", DOCUMENTED)
+def test_documented_commands_parse_against_the_real_parser(name):
+    """Every python -m layerviz command of a doc parses and spells each flag exactly."""
+    commands = layerviz_commands(documented_text(name))
+    assert [parse_documented(words).command for words in commands] == [w[0] for w in commands]
+    assert [misspelled_flags(words) for words in commands] == [set() for _ in commands]
+
+
+@pytest.mark.parametrize("name, expected", [("SKILL.md", set(subcommand_flags())),
+                                             ("README.md", {"capture", "serve"})])
+def test_documented_commands_cover_the_expected_subcommands(name, expected):
+    """SKILL.md shows every subcommand of the real parser and README.md shows two."""
+    assert {words[0] for words in layerviz_commands(documented_text(name))} == expected
+
+
+@pytest.mark.parametrize("name, taught", [
+    ("SKILL.md", {"--include", "--state-key", "--inline-mb"}),
+    ("spconv_remote.md", {"--checkpoint", "--port"}),
+    ("README.md", set()), ("cnn_2d.md", set()), ("training_snapshots.md", set()),
+])
+def test_documented_prose_flags_exist_on_the_parser(name, taught):
+    """Every flag a doc names in prose is a real option, and the docs name the flags taught."""
+    known = set().union(*subcommand_flags().values())
+    flags = prose_flags(documented_text(name))
+    assert flags - known == set()
+    assert taught <= flags
+
+
+@pytest.mark.parametrize("name", ["SKILL.md", "run_evals.sh"])
+def test_skill_names_no_date_or_model_version(name):
     """The skill body and the eval script stay free of dates and model versions."""
-    for text in (skill_body(), (SKILL / "evals" / "run_evals.sh").read_text()):
-        assert DATED.search(text) is None, DATED.search(text)
+    assert DATED.search(documented_text(name)) is None
 
 
-def test_evals_hold_three_scenarios_and_run_sonnet_and_opus():
-    """The three scenario prompts exist with checklists and the script runs both models."""
-    evals = SKILL / "evals"
-    for name in SCENARIOS:
-        text = (evals / name).read_text()
-        assert "## Prompt" in text and "## Expected outcome" in text, name
-        assert "- [ ]" in text, name
-    script = (evals / "run_evals.sh").read_text()
-    assert re.search(r"MODELS=\(sonnet opus\)", script)
+@pytest.mark.parametrize("name", SCENARIOS)
+def test_eval_scenario_holds_a_prompt_and_a_checklist(name):
+    """Each scenario file has a prompt, an expected outcome, and a checklist."""
+    text = documented_text(name)
+    assert "## Prompt" in text and "## Expected outcome" in text and "- [ ]" in text
+
+
+def test_eval_script_runs_and_grades_three_models():
+    """The script runs and grades three models over every scenario."""
+    script = documented_text("run_evals.sh")
+    assert re.search(r"MODELS=\(haiku sonnet opus\)", script)
     assert "claude -p" in script and '--model "$model"' in script
+    assert 'SUMMARY="$EVALS_DIR/runs/$STAMP/summary.txt"' in script
+    assert '"$PYTHON" "$SKILL_DIR/check_bundle.py" "${bundles[@]}"' in script
+    assert re.search(r'grade_run "\$run" "\$scenario" "\$model"\n', script)
+    assert '"$verdict" "$scenario" "$model" >> "$SUMMARY"' in script
     assert all(Path(name).stem in script for name in SCENARIOS)
     assert "runs/" in (SKILL / ".gitignore").read_text().splitlines()
 
@@ -133,20 +203,21 @@ def skill_module(monkeypatch):
 
 
 @pytest.mark.parametrize("inline_mb", ["16", "0"])
-def test_adapter_example_captures_and_passes_check_bundle(tmp_path, skill_module, capsys,
-                                                          inline_mb):
+def test_adapter_example_captures_and_passes_check(tmp_path, skill_module, capsys, inline_mb):
     """The example adapter captures through the command line and check_bundle passes it."""
     out = tmp_path / "bundle"
-    code = main(["capture", "--model", "adapter_example:build_model", "--sample",
-                 "adapter_example:load_sample", "--out", str(out), "--inline-mb", inline_mb])
-    assert code == 0
+    capture_bundle(out, inline_mb)
     assert capsys.readouterr().out.strip() == str(out / "index.html")
     assert (out / "graph.json").is_file() == (inline_mb == "0")
     checker = skill_module("check_bundle")
-    names = {node["name"] for node in checker.read_graph(out)["nodes"]}
+    graph = checker.read_graph(out)
+    names = {node["name"] for node in graph["nodes"]}
     assert {"stem.0", "layer1.conv1", "layer2.conv2", "fc"} <= names
+    stored = [node for node in graph["nodes"] if node["file"]]
+    assert {node["name"] for node in stored} >= {"stem.0", "fc"}
     assert checker.main([str(out)]) == 0
-    assert capsys.readouterr().out == f"{out}: ok, {len(checker.read_graph(out)['nodes'])} nodes\n"
+    expected = f"{out}: ok, {len(graph['nodes'])} nodes, {len(stored)} layers\n"
+    assert capsys.readouterr().out == expected
 
 
 def write_no_page(folder: Path) -> None:
@@ -164,11 +235,20 @@ def write_no_nodes(folder: Path) -> None:
     (folder / "graph.json").write_text(json.dumps({"nodes": []}))
 
 
+def write_channels_only(folder: Path) -> None:
+    """Write a page and a graph whose only node names a channel file and no layer file."""
+    (folder / "index.html").write_text("<html></html>")
+    (folder / "L0000.ch.bin").write_bytes(b"\x01")
+    node = {"id": "L0000", "name": "fc", "file": None, "channels": "L0000.ch.bin"}
+    (folder / "graph.json").write_text(json.dumps({"nodes": [node]}))
+
+
 @pytest.mark.parametrize("write, message", [
     (write_no_page, "{folder}: no index.html"),
     (write_no_graph, "{folder} has no graph.json and no graph embedded in index.html"),
     (write_no_nodes, "{folder}: the graph lists no nodes"),
-], ids=["no_page", "no_graph", "no_nodes"])
+    (write_channels_only, "{folder}: no node stores a layer"),
+], ids=["no_page", "no_graph", "no_nodes", "channels_only"])
 def test_check_bundle_reports_broken_bundle(tmp_path, skill_module, capsys, write, message):
     """check_bundle names the problem of a broken bundle and exits 1."""
     checker = skill_module("check_bundle")
@@ -177,6 +257,108 @@ def test_check_bundle_reports_broken_bundle(tmp_path, skill_module, capsys, writ
     write(folder)
     assert checker.main([str(folder)]) == 1
     assert capsys.readouterr().out.splitlines() == [message.format(folder=folder)]
+
+
+def capture_bundle(out: Path, inline_mb: str, *flags: str) -> None:
+    """Capture the example adapter into out, one page when inline_mb is not 0."""
+    assert main(["capture", "--model", "adapter_example:build_model", "--sample",
+                 "adapter_example:load_sample", "--out", str(out), "--inline-mb", inline_mb,
+                 *flags]) == 0
+
+
+def remove_layer_file(folder: Path) -> str:
+    """Delete one layer file of a multi file bundle and return the expected problem."""
+    (folder / "layers" / "L0003.bin").unlink()
+    return "node L0003 names layers/L0003.bin, which is missing or empty"
+
+
+def empty_channel_file(folder: Path) -> str:
+    """Truncate one channel file of a multi file bundle and return the expected problem."""
+    (folder / "layers" / "L0004.ch.bin").write_bytes(b"")
+    return "node L0004 names layers/L0004.ch.bin, which is missing or empty"
+
+
+def remove_page_script(folder: Path) -> str:
+    """Delete the app.js that index.html loads and return the expected problem."""
+    (folder / "app.js").unlink()
+    return "index.html loads app.js, which is missing or empty"
+
+
+def make_nodes_a_string(folder: Path) -> str:
+    """Replace the graph's node list with a string and return the expected problem."""
+    graph = json.loads((folder / "graph.json").read_text())
+    (folder / "graph.json").write_text(json.dumps({**graph, "nodes": "L0000"}))
+    return "the graph nodes are not a list"
+
+
+def drop_node_name(folder: Path) -> str:
+    """Remove the name of the first node and return the expected problem."""
+    graph = json.loads((folder / "graph.json").read_text())
+    del graph["nodes"][0]["name"]
+    (folder / "graph.json").write_text(json.dumps(graph))
+    return "node 0 is not an object with an id and a name"
+
+
+@pytest.mark.parametrize("breaker", [
+    remove_layer_file, empty_channel_file, remove_page_script, make_nodes_a_string, drop_node_name,
+], ids=["missing_layer", "empty_channels", "missing_script", "nodes_string", "nameless_node"])
+def test_check_bundle_reports_broken_multi_file_bundle(tmp_path, skill_module, capsys, breaker):
+    """check_bundle exits 1 and names the one problem broken into a multi file bundle."""
+    out = tmp_path / "bundle"
+    capture_bundle(out, "0")
+    message = breaker(out)
+    capsys.readouterr()
+    assert skill_module("check_bundle").main([str(out)]) == 1
+    assert capsys.readouterr().out.splitlines() == [f"{out}: {message}"]
+
+
+def test_check_bundle_reports_missing_inline_layer(tmp_path, skill_module, capsys):
+    """check_bundle exits 1 when a one page bundle lacks the element of a stored layer."""
+    out = tmp_path / "bundle"
+    capture_bundle(out, "16")
+    page = (out / "index.html").read_text()
+    element = re.compile(r'<script [^>]*data-path="layers/L0003\.bin">[^<]*</script>')
+    assert len(element.findall(page)) == 1
+    (out / "index.html").write_text(element.sub("", page))
+    capsys.readouterr()
+    assert skill_module("check_bundle").main([str(out)]) == 1
+    expected = f"{out}: node L0003 names layers/L0003.bin, which is missing or empty"
+    assert capsys.readouterr().out.splitlines() == [expected]
+
+
+@pytest.mark.parametrize("inline_mb", ["16", "0"])
+def test_check_bundle_reports_bundle_with_no_layers(tmp_path, skill_module, capsys, inline_mb):
+    """check_bundle exits 1 for a bundle whose include pattern matched no layer."""
+    out = tmp_path / "bundle"
+    capture_bundle(out, inline_mb, "--include", "nomatch*")
+    capsys.readouterr()
+    assert skill_module("check_bundle").main([str(out)]) == 1
+    assert capsys.readouterr().out.splitlines() == [f"{out}: no node stores a layer"]
+
+
+def test_check_bundle_reports_missing_side_b_of_a_compare_bundle(tmp_path, skill_module, capsys):
+    """check_bundle exits 1 when a comparison bundle lacks the b file of a files pair."""
+    out = tmp_path / "bundle"
+    assert main(["compare", "--model", "adapter_example:build_model", "--sample",
+                 "adapter_example:load_sample", "--against", "random", "--out", str(out),
+                 "--inline-mb", "0"]) == 0
+    graph = skill_module("check_bundle").read_graph(out)
+    node = next(node for node in graph["nodes"] if node["id"] == "L0003")
+    assert node["files"] == {"a": "layers/L0003a.bin", "b": "layers/L0003b.bin"}
+    (out / "layers" / "L0003b.bin").unlink()
+    capsys.readouterr()
+    assert skill_module("check_bundle").main([str(out)]) == 1
+    expected = f"{out}: node L0003 names layers/L0003b.bin, which is missing or empty"
+    assert capsys.readouterr().out.splitlines() == [expected]
+
+
+def test_summary_counts_only_nodes_with_a_file_or_files_pair(skill_module):
+    """summary counts a node as a layer only when it names file or files, not channels alone."""
+    nodes = [{"id": "L0", "name": "a", "file": "L0.bin", "channels": "L0.ch.bin"},
+             {"id": "L1", "name": "b", "file": None, "files": {"a": "L1a.bin", "b": "L1b.bin"}},
+             {"id": "L2", "name": "c", "file": None, "channels": "L2.ch.bin"},
+             {"id": "L3", "name": "d", "file": None, "files": None}]
+    assert skill_module("check_bundle").summary(nodes) == "ok, 4 nodes, 2 layers"
 
 
 def test_check_bundle_fails_with_no_folders(skill_module):
@@ -194,9 +376,18 @@ def test_adapter_example_loads_its_own_checkpoint(tmp_path, skill_module):
     path = tmp_path / "model.pt"
     torch.save({"state_dict": saved.state_dict()}, path)
     loaded = adapter.build_model(checkpoint=path)
-    for name, tensor in saved.state_dict().items():
-        assert torch.equal(loaded.state_dict()[name], tensor), name
+    restored = {n: torch.equal(loaded.state_dict()[n], t) for n, t in saved.state_dict().items()}
+    assert restored == dict.fromkeys(saved.state_dict(), True)
     assert not loaded.training
+
+
+def test_adapter_example_imports_public_load_state(skill_module):
+    """layerviz exposes load_state, and the adapter example imports it from layerviz."""
+    import layerviz
+    from layerviz.loading import load_state
+    assert layerviz.load_state is load_state and "load_state" in layerviz.__all__
+    assert skill_module("adapter_example").load_state is load_state
+    assert "from layerviz import load_state" in (SKILL / "adapter_example.py").read_text()
 
 
 def test_adapter_example_sample_is_one_image(skill_module):

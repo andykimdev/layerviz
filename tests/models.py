@@ -1,10 +1,12 @@
 """
-Build tiny CPU models, matching samples, and a fake sparse tensor for layerviz tests.
+Build tiny CPU models, a fake sparse tensor, and the file readers shared by tests.
 
 Purpose:
 
 - Provide one builder per data shape, each returning (model, batch) deterministically.
 - Provide FakeSparseTensor, a stand in for spconv SparseConvTensor without spconv.
+- Provide read_frame and make_web, so no test module imports another test module. The
+  other file, node, and browser helpers live in tests/harness.py.
 
 Special Notes:
 
@@ -12,6 +14,9 @@ Special Notes:
 - ALL_SHAPES maps a shape name to its builder for parametrized tests.
 """
 
+import json
+import struct
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -336,3 +341,34 @@ ALL_SHAPES = {
     "sparse": sparse_model,
     "graph": graph_model,
 }
+
+
+def read_frame(blob: bytes) -> tuple[dict, bytes, int]:
+    """
+    Split framed bytes into the header and the data that follows it.
+
+    Args:
+        blob: A uint32 header length, a JSON header, then the data.
+
+    Returns:
+        The tuple (header dict, data bytes, header length in bytes).
+    """
+    (length,) = struct.unpack("<I", blob[:4])
+    return json.loads(blob[4 : 4 + length].decode("utf-8")), blob[4 + length :], length
+
+
+def make_web(root: Path) -> Path:
+    """
+    Write a minimal web folder with a page template and an entry module.
+
+    Args:
+        root: Folder that receives the web subfolder.
+
+    Returns:
+        The path of the new web folder.
+    """
+    web = root / "web"
+    web.mkdir()
+    (web / "index.html").write_text("<html><body><!-- layerviz:scripts --></body></html>")
+    (web / "app.js").write_text("console.log(1);\n")
+    return web

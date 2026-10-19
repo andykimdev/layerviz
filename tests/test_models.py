@@ -5,8 +5,13 @@ Purpose:
 
 - Pin the exact output shape of each data shape builder.
 - Pin that builders are deterministic and that FakeSparseTensor keeps its structure.
+- Pin the file helpers that read framed layer files and write the fake web folder.
 """
 
+import json
+import struct
+
+import numpy as np
 import pytest
 import torch
 
@@ -15,8 +20,11 @@ from tests.models import (
     FakeSparseTensor,
     SparseDownsample,
     graph_model,
+    make_web,
+    read_frame,
     sparse_model,
 )
+from tests.harness import read_sections
 
 EXPECTED_OUTPUT_SHAPES = {
     "image2d": (1, 6, 8, 8),
@@ -162,3 +170,54 @@ def test_replace_feature_keeps_structure_and_swaps_features():
     assert replaced.spatial_shape == [4, 4, 4]
     assert replaced.batch_size == 1
     assert original.features.shape == (2, 3)
+
+
+def frame_bytes(header, body=b""):
+    """
+    Frame a header and a body the way layer files are laid out.
+
+    Args:
+        header: Dict written as JSON.
+        body: Bytes that follow the header.
+
+    Returns:
+        A little endian uint32 length, the JSON header, then the body.
+    """
+    encoded = json.dumps(header).encode("utf-8")
+    return struct.pack("<I", len(encoded)) + encoded + body
+
+
+def test_read_frame_splits_header_data_and_length():
+    header = {"n": 3, "kind": "é"}
+    blob = frame_bytes(header, b"\x01\x02\x03")
+
+    got_header, data, length = read_frame(blob)
+
+    assert got_header == header
+    assert data == b"\x01\x02\x03"
+    assert length == len(json.dumps(header).encode("utf-8"))
+
+
+def test_make_web_writes_page_template_and_entry_module(tmp_path):
+    web = make_web(tmp_path)
+
+    assert web == tmp_path / "web"
+    assert "<!-- layerviz:scripts -->" in (web / "index.html").read_text()
+    assert (web / "app.js").read_text() == "console.log(1);\n"
+
+
+def test_read_sections_decodes_each_section_with_its_dtype(tmp_path):
+    positions = np.array([1.5, -2.0], dtype="<f4")
+    rgb = np.array([7, 8, 9], dtype="uint8")
+    body = positions.tobytes() + rgb.tobytes()
+    sections = {"positions": [0, 8, "<f4"], "rgb": [8, 3, "uint8"]}
+    path = tmp_path / "L0001.bin"
+    path.write_bytes(frame_bytes({"n": 2, "sections": sections}, body))
+
+    header, decoded = read_sections(path)
+
+    assert header["n"] == 2
+    assert sorted(decoded) == ["positions", "rgb"]
+    assert decoded["positions"].dtype == np.dtype("<f4")
+    np.testing.assert_array_equal(decoded["positions"], positions)
+    np.testing.assert_array_equal(decoded["rgb"], rgb)

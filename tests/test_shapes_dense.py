@@ -7,6 +7,8 @@ Purpose:
 - Check that downsampled grids land on input coordinates and defaults register once.
 """
 
+import inspect
+
 import numpy as np
 import pytest
 import torch
@@ -136,30 +138,36 @@ def test_image2d_uses_the_last_two_input_axes() -> None:
     assert layer.positions[:, 1].tolist() == [0.5, 2.5, 0.5, 2.5]
 
 
-@pytest.mark.parametrize(
-    "plugin, rank",
-    [
-        (dense.Image2dPlugin(), 4),
-        (dense.Volume3dPlugin(), 5),
-        (dense.TokensPlugin(), 3),
-        (dense.VectorPlugin(), 2),
-    ],
-)
-def test_each_plugin_accepts_only_its_rank(plugin, rank) -> None:
-    ctx = context(None)
-    for other in range(1, 7):
-        tensor = torch.zeros((1,) * other)
-        assert plugin.accepts(tensor, ctx) is (other == rank)
-    assert plugin.accepts(np.zeros((1,) * rank), ctx) is False
+PLUGIN_RANKS = [
+    (dense.Image2dPlugin(), 4),
+    (dense.Volume3dPlugin(), 5),
+    (dense.TokensPlugin(), 3),
+    (dense.VectorPlugin(), 2),
+]
+
+
+@pytest.mark.parametrize("plugin, rank", PLUGIN_RANKS)
+@pytest.mark.parametrize("other", range(1, 7))
+def test_each_plugin_accepts_only_its_rank(plugin, rank, other) -> None:
+    tensor = torch.zeros((1,) * other)
+    assert plugin.accepts(tensor, context(None)) is (other == rank)
+
+
+@pytest.mark.parametrize("plugin, rank", PLUGIN_RANKS)
+def test_each_plugin_rejects_numpy(plugin, rank) -> None:
+    assert plugin.accepts(np.zeros((1,) * rank), context(None)) is False
+
+
+@pytest.mark.parametrize("plugin, rank", PLUGIN_RANKS)
+def test_each_plugin_returns_its_tensor_as_a_list(plugin, rank) -> None:
     tensor = torch.zeros((1,) * rank)
     assert plugin.tensors(tensor) == [tensor]
 
 
-def test_import_registers_defaults_once_in_rank_order() -> None:
-    names = [p.name for p in base.plugins()]
-    assert [n for n in names if n in DEFAULT_NAMES] == DEFAULT_NAMES
-    dense.register_defaults()
-    assert [p.name for p in base.plugins()] == names
+def test_rank_mismatch_error_names_both_ranks() -> None:
+    output = torch.zeros(1, 2, 4, 4, 4)
+    with pytest.raises(ValueError, match="grid has 3 axes, input_grid has 2"):
+        dense.Volume3dPlugin().extract(output, context((8, 8)))
 
 
 def test_register_defaults_fills_an_empty_registry(monkeypatch) -> None:
@@ -167,3 +175,31 @@ def test_register_defaults_fills_an_empty_registry(monkeypatch) -> None:
     dense.register_defaults()
     dense.register_defaults()
     assert [p.name for p in base.plugins()] == DEFAULT_NAMES
+
+
+class _UserPlugin(dense.VectorPlugin):
+    """Stand in for a user plugin registered before the defaults."""
+
+    name = "user"
+
+
+def test_register_defaults_keeps_a_user_plugin_first(monkeypatch) -> None:
+    monkeypatch.setattr(base, "REGISTRY", [])
+    user = _UserPlugin()
+    base.register_shape(user)
+    dense.register_defaults()
+    assert base.plugins()[0] is user
+    assert [p.name for p in base.plugins()] == ["user", *DEFAULT_NAMES]
+
+
+def test_to_numpy_lives_only_in_base() -> None:
+    assert inspect.isfunction(base.to_numpy)
+    assert not hasattr(dense, "_to_numpy")
+
+
+def test_to_numpy_returns_detached_float32_on_cpu() -> None:
+    tensor = torch.tensor([[1.5, -2.0]], dtype=torch.float64, requires_grad=True)
+    array = base.to_numpy(tensor)
+    assert isinstance(array, np.ndarray)
+    assert array.dtype == np.float32
+    np.testing.assert_array_equal(array, np.array([[1.5, -2.0]], dtype=np.float32))

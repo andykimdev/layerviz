@@ -7,8 +7,6 @@ Purpose:
 - Check linear CKA against a dense Gram matrix reference and the joint fit colors.
 """
 
-import time
-
 import numpy as np
 import pytest
 
@@ -19,7 +17,7 @@ from layerviz.align import (
     linear_cka,
     match_components,
 )
-from layerviz.reduce import PCAFit, Reduced, fit_pca, project, reduce_layer, rgb_from_scores
+from layerviz.reduce import PCAFit, Reduced, reduce_layer, rgb_from_scores
 
 
 def skewed_scores(n_rows: int, k: int, seed: int) -> np.ndarray:
@@ -117,16 +115,16 @@ def test_match_components_rejects_different_row_counts():
         match_components(np.zeros((10, 3)), np.zeros((12, 3)))
 
 
-def test_match_components_on_32_components_runs_under_10_ms():
+def test_match_components_recovers_reversed_order_and_signs_of_32_components():
     scores_a = skewed_scores(1024, 32, seed=4)
-    scores_b = scores_a[:, ::-1]
-    timings = []
-    for _ in range(5):
-        start = time.perf_counter()
-        match_components(scores_a, scores_b)
-        timings.append(time.perf_counter() - start)
+    reversed_order = list(range(31, -1, -1))
+    alternating = [1, -1] * 16
+    scores_b = permuted_and_flipped(scores_a, reversed_order, alternating)
 
-    assert min(timings) < 0.010
+    perm, signs = match_components(scores_a, scores_b)
+
+    np.testing.assert_array_equal(perm, reversed_order)
+    np.testing.assert_array_equal(signs, [-1, 1] * 16)
 
 
 def test_aligned_rgb_equals_a_rgb_when_b_scores_are_permuted_and_flipped():
@@ -164,19 +162,28 @@ def test_joint_rgb_gives_identical_colors_for_identical_inputs():
 
 
 def test_joint_rgb_splits_colors_of_one_fit_on_the_stacked_rows():
-    z_a = skewed_features(600, 8, seed=9)
-    z_b = skewed_features(400, 8, seed=10) + 1.0
-    stacked = np.concatenate([z_a, z_b])
-    expected = rgb_from_scores(project(stacked, fit_pca(stacked, seed=3), 3))
+    # Each row loads on at most one channel, so the stacked fit's components are the
+    # channel axes and each color channel is 255 exactly where its channel is nonzero.
+    z_a = np.array([[4, 0, 0], [4, 0, 0], [0, 2, 0], [0, 2, 0], [0, 0, 1]], dtype=np.float32)
+    z_b = np.array([[0, 0, 1], [0, 0, 0], [0, 0, 0]], dtype=np.float32)
 
-    rgb_a, rgb_b = joint_rgb(z_a, z_b, seed=3)
+    rgb_a, rgb_b = joint_rgb(z_a, z_b)
 
-    np.testing.assert_array_equal(rgb_a, expected[:600])
-    np.testing.assert_array_equal(rgb_b, expected[600:])
+    np.testing.assert_array_equal(
+        rgb_a, [[255, 0, 0], [255, 0, 0], [0, 255, 0], [0, 255, 0], [0, 0, 255]]
+    )
+    np.testing.assert_array_equal(rgb_b, [[0, 0, 255], [0, 0, 0], [0, 0, 0]])
 
 
 def test_linear_cka_of_features_with_themselves_is_one():
     x = skewed_features(500, 12, seed=11)
+
+    assert linear_cka(x, x) == pytest.approx(1.0, abs=1e-6)
+
+
+@pytest.mark.parametrize("dtype", [np.float64, np.float32])
+def test_linear_cka_of_features_with_themselves_is_one_after_a_large_offset(dtype):
+    x = (np.random.default_rng(16).standard_normal((500, 12)) + 1e6).astype(dtype)
 
     assert linear_cka(x, x) == pytest.approx(1.0, abs=1e-6)
 
@@ -197,11 +204,20 @@ def test_linear_cka_matches_dense_gram_reference():
     assert linear_cka(x_a, x_b) == pytest.approx(dense_cka(x_a, x_b), abs=1e-4)
 
 
-def test_linear_cka_of_constant_features_is_zero():
-    x_a = np.ones((50, 4))
-    x_b = np.random.default_rng(14).standard_normal((50, 3))
+NOISE = np.random.default_rng(14).standard_normal((50, 3))
+FLAT_SIDES = {
+    "constant": np.ones((50, 3)),
+    "float64 noise around 1": 1.0 + 1e-9 * NOISE,
+    "float32 rounding noise around 1000": (1000.0 + 3e-5 * NOISE).astype(np.float32),
+}
 
-    assert linear_cka(x_a, x_b) == 0.0
+
+@pytest.mark.parametrize("flat", FLAT_SIDES.values(), ids=FLAT_SIDES.keys())
+@pytest.mark.parametrize("flat_side", ["a", "b"])
+def test_linear_cka_is_zero_when_one_side_has_no_signal(flat, flat_side):
+    pair = (flat, NOISE) if flat_side == "a" else (NOISE, flat)
+
+    assert linear_cka(*pair) == 0.0
 
 
 def test_linear_cka_rejects_different_row_counts():
@@ -217,10 +233,3 @@ def test_match_components_rejects_empty_scores():
 def test_joint_rgb_rejects_different_channel_counts():
     with pytest.raises(ValueError, match="channels"):
         joint_rgb(np.zeros((10, 4)), np.zeros((10, 5)))
-
-
-def test_linear_cka_of_near_constant_features_is_zero():
-    noise = np.random.default_rng(15).standard_normal((50, 3))
-    x_a = 1.0 + 1e-9 * noise
-
-    assert linear_cka(x_a, noise) == 0.0

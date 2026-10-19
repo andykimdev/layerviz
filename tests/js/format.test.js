@@ -4,6 +4,7 @@
  * Purpose:
  * - Pin the binary framing that bundle.py must write and format.js must read.
  * - Check float16 decoding, the optional rgb_joint section, and framing errors.
+ * - Check that bad header fields, sections, and base64 text raise errors naming the cause.
  *
  * Special Notes:
  * - Buffers are built byte by byte here, never by bundle.py, so the test fixes the layout.
@@ -12,7 +13,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { parseLayer, parseChannels, base64ToBuffer } from "../../layerviz/web/format.js";
+import {
+  parseLayer, parseChannels, base64ToBuffer, decodeFloat16,
+} from "../../layerviz/web/format.js";
 
 const N = 4;
 const DIM = 2;
@@ -70,10 +73,13 @@ function buildFile(header, sections) {
 
 /**
  * Build the n = 4, dim = 2, k = 3 layer file, with rgb_joint when asked.
+ *
+ * Header fields in fields replace the defaults, and an undefined value drops the field.
  */
-function buildLayer({ joint = false } = {}) {
+function buildLayer({ joint = false, fields = {} } = {}) {
   const header = {
     n: N, dim: DIM, k: K, kind: "points", grid: null, scale: [1, 1], labels: ["a", "b", "c", "dä"],
+    ...fields,
   };
   const sections = [
     ["positions", "float32", bytesOf(new Float32Array(POSITIONS))],
@@ -88,11 +94,28 @@ function buildLayer({ joint = false } = {}) {
 
 /**
  * Build a channel file with n = 4 points and c = 2 channels.
+ *
+ * Header fields in fields replace the defaults, and sections replaces the values section.
  */
-function buildChannels() {
-  const header = { n: N, c: 2, channels: [5, 17] };
-  return buildFile(header, [["values", "uint8", new Uint8Array(CHANNEL_VALUES)]]);
+function buildChannels({
+  fields = {}, sections = [["values", "uint8", new Uint8Array(CHANNEL_VALUES)]],
+} = {}) {
+  const header = { n: N, c: 2, channels: [5, 17], ...fields };
+  return buildFile(header, sections);
 }
+
+/**
+ * Frame raw header text with no sections after it.
+ */
+function frameHeaderText(text) {
+  const json = new TextEncoder().encode(text);
+  const out = new Uint8Array(4 + json.length);
+  new DataView(out.buffer).setUint32(0, json.length, true);
+  out.set(json, 4);
+  return out.buffer;
+}
+
+const BAD_COUNTS = [["missing", undefined], ["negative", -1], ["fractional", 1.5], ["a string", "4"]];
 
 test("parseLayer decodes positions as float32 in point order", () => {
   const record = parseLayer(buildLayer());
@@ -164,11 +187,6 @@ test("parseLayer rejects a buffer too short to hold the header length", () => {
   assert.throws(() => parseLayer(new ArrayBuffer(2)), /header length/);
 });
 
-test("parseLayer rejects a section that runs past the end of the buffer", () => {
-  const buffer = buildLayer();
-  assert.throws(() => parseLayer(buffer.slice(0, buffer.byteLength - 8)), /scores/);
-});
-
 test("parseLayer rejects a section whose size does not match its shape", () => {
   const header = { n: N, dim: DIM, k: K, kind: "points", grid: null, scale: null, labels: null };
   const buffer = buildFile(header, [
@@ -199,14 +217,124 @@ test("parseLayer rejects a header without the rgb section", () => {
 });
 
 test("parseLayer rejects a header that is not valid JSON", () => {
-  const out = new Uint8Array(8);
-  new DataView(out.buffer).setUint32(0, 4, true);
-  out.set(new TextEncoder().encode("{bad"), 4);
-  assert.throws(() => parseLayer(out.buffer), /header is not valid JSON/);
+  assert.throws(() => parseLayer(frameHeaderText("{bad")), /header is not valid JSON/);
+});
+
+test("parseLayer rejects a header that is JSON null", () => {
+  assert.throws(() => parseLayer(frameHeaderText("null")), {
+    message: "header must be a JSON object, got null",
+  });
+});
+
+for (const field of ["n", "dim", "k"]) {
+  for (const [label, value] of BAD_COUNTS) {
+    test(`parseLayer rejects a header whose ${field} is ${label}`, () => {
+      const buffer = buildLayer({ fields: { [field]: value } });
+      assert.throws(() => parseLayer(buffer), {
+        message: `header field ${field} must be a non-negative integer, got ${JSON.stringify(value)}`,
+      });
+    });
+  }
+}
+
+for (const [label, value] of [["missing", undefined], ["a number", 3], ["null", null]]) {
+  test(`parseLayer rejects a header whose kind is ${label}`, () => {
+    const buffer = buildLayer({ fields: { kind: value } });
+    assert.throws(() => parseLayer(buffer), {
+      message: `header field kind must be a string, got ${JSON.stringify(value)}`,
+    });
+  });
+}
+
+test("parseLayer names the section and the buffer end when a section is oversized", () => {
+  const full = buildLayer();
+  const cut = full.byteLength - 8;
+  // Scores is the last section and fills the buffer to its end, so it ends at full.
+  assert.throws(() => parseLayer(full.slice(0, cut)), {
+    message: `section scores ends at byte ${full.byteLength}, past the buffer end at ${cut} bytes`,
+  });
+});
+
+test("parseLayer decodes a layer with n = 0 into empty arrays", () => {
+  const header = { n: 0, dim: 3, k: 2, kind: "points", grid: null, scale: null, labels: [] };
+  const buffer = buildFile(header, [
+    ["positions", "float32", new Uint8Array(0)],
+    ["rgb", "uint8", new Uint8Array(0)],
+    ["scores", "float16", new Uint8Array(0)],
+  ]);
+  const record = parseLayer(buffer);
+  assert.deepEqual(record.positions, new Float32Array(0));
+  assert.deepEqual(record.rgb, new Uint8Array(0));
+  assert.deepEqual(record.scores, new Float32Array(0));
+  assert.equal(record.rgbJoint, null);
+});
+
+test("parseLayer decodes a float16 scores section holding -Infinity", () => {
+  const header = { n: 1, dim: 1, k: 2, kind: "points", grid: null, scale: null, labels: null };
+  const buffer = buildFile(header, [
+    ["positions", "float32", bytesOf(new Float32Array([0]))],
+    ["rgb", "uint8", new Uint8Array([0, 0, 0])],
+    ["scores", "float16", bytesOf(new Uint16Array([0xfc00, 0xbc00]))],
+  ]);
+  assert.deepEqual(parseLayer(buffer).scores, new Float32Array([-Infinity, -1]));
+});
+
+test("decodeFloat16 decodes little endian half values into a Float32Array", () => {
+  const bytes = new Uint16Array([0x3c00, 0xfc00, 0x0001, 0xc000]).buffer;
+  assert.deepEqual(decodeFloat16(bytes), new Float32Array([1, -Infinity, 2 ** -24, -2]));
+});
+
+for (const field of ["n", "c"]) {
+  for (const [label, value] of BAD_COUNTS) {
+    test(`parseChannels rejects a header whose ${field} is ${label}`, () => {
+      const buffer = buildChannels({ fields: { [field]: value } });
+      assert.throws(() => parseChannels(buffer), {
+        message: `header field ${field} must be a non-negative integer, got ${JSON.stringify(value)}`,
+      });
+    });
+  }
+}
+
+test("parseChannels rejects a file without the values section", () => {
+  assert.throws(() => parseChannels(buildChannels({ sections: [] })), {
+    message: "section values is missing from the header",
+  });
+});
+
+test("parseChannels rejects a values section whose dtype is not uint8", () => {
+  const sections = [["values", "float16", bytesOf(new Uint16Array([1, 2, 3, 4]))]];
+  assert.throws(() => parseChannels(buildChannels({ sections })), {
+    message: "section values has dtype float16, expected uint8",
+  });
+});
+
+test("parseChannels rejects a values section whose size does not match n times c", () => {
+  const sections = [["values", "uint8", new Uint8Array([1, 2, 3, 4, 5, 6])]];
+  assert.throws(() => parseChannels(buildChannels({ sections })), {
+    message: "section values has 6 bytes, its shape needs 8",
+  });
+});
+
+test("parseChannels rejects a values section that runs past the buffer end", () => {
+  const full = buildChannels();
+  const cut = full.byteLength - 4;
+  assert.throws(() => parseChannels(full.slice(0, cut)), {
+    message: `section values ends at byte ${full.byteLength}, past the buffer end at ${cut} bytes`,
+  });
 });
 
 test("base64ToBuffer returns the decoded bytes as an ArrayBuffer", () => {
   const buffer = base64ToBuffer("AQID+g==");
   assert.ok(buffer instanceof ArrayBuffer);
   assert.deepEqual(Array.from(new Uint8Array(buffer)), [1, 2, 3, 250]);
+});
+
+test("base64ToBuffer rejects text that is not valid base64", () => {
+  assert.throws(() => base64ToBuffer("not base64!"), (error) => {
+    assert.equal(error.name, "Error");
+    assert.match(error.message, /^base64 text is not valid: /);
+    assert.equal(error.cause.name, "InvalidCharacterError");
+    assert.ok(error.message.endsWith(error.cause.message));
+    return true;
+  });
 });

@@ -8,10 +8,9 @@ Purpose:
 
 Special Notes:
 
-- Layer files are decoded with read_frame from tests/test_bundle.py.
+- Layer files are decoded with the readers in tests/harness.py and tests/models.py.
 """
 
-import json
 from pathlib import Path
 
 import numpy as np
@@ -24,8 +23,8 @@ from layerviz.api import build_graph, capture
 from layerviz.budget import MB
 from layerviz.pipeline import CaptureOptions, run_pipeline
 from layerviz.snapshots import due, is_main_process, list_steps, step_dir, write_index
-from tests.models import as_eval_pair, image2d_model
-from tests.test_bundle import read_frame
+from tests.harness import read_graph, read_positions
+from tests.models import as_eval_pair, image2d_model, make_web
 
 SMALL_LAYER_MB = 0.004
 
@@ -42,24 +41,7 @@ def same_grid_model():
 @pytest.fixture
 def web(tmp_path) -> Path:
     """Write a minimal web folder with a page template and an entry module."""
-    folder = tmp_path / "web"
-    folder.mkdir()
-    (folder / "index.html").write_text("<html><body><!-- layerviz:scripts --></body></html>")
-    (folder / "app.js").write_text("console.log(1);\n")
-    return folder
-
-
-def read_graph(folder: Path) -> dict:
-    """Load graph.json from a bundle folder."""
-    return json.loads((folder / "graph.json").read_text(encoding="utf-8"))
-
-
-def read_positions(blob: bytes) -> np.ndarray:
-    """Decode the positions section of one layer file as an [n, dim] float32 array."""
-    header, body, _ = read_frame(blob)
-    offset, length, _ = header["sections"]["positions"]
-    data = np.frombuffer(body[offset : offset + length], dtype="<f4")
-    return data.reshape(header["n"], header["dim"])
+    return make_web(tmp_path)
 
 
 def count_forwards(model: nn.Module) -> list:
@@ -297,3 +279,57 @@ def test_capture_restores_the_training_and_grad_modes(tmp_path, web):
     assert model.training is True
     assert torch.is_grad_enabled() is True
     assert all(p.requires_grad for p in model.parameters())
+
+
+def test_step_dir_rejects_a_negative_step(tmp_path):
+    with pytest.raises(ValueError, match="step=-5"):
+        step_dir(tmp_path, -5)
+
+
+def test_capture_with_every_but_no_step_raises_and_never_runs_forward(tmp_path, web):
+    out = tmp_path / "out"
+    model, batch = image2d_model()
+    calls = count_forwards(model)
+
+    with pytest.raises(ValueError, match="every=5"):
+        capture(model, batch, out, web_dir=web, every=5)
+
+    assert calls == []
+    assert not out.exists()
+
+
+def test_capture_with_a_negative_step_raises_and_writes_no_folder(tmp_path, web):
+    out = tmp_path / "out"
+    model, batch = image2d_model()
+
+    with pytest.raises(ValueError, match="step=-5"):
+        capture(model, batch, out, web_dir=web, step=-5)
+
+    assert not (out / "step_-00005").exists()
+    assert list_steps(out) == []
+
+
+def test_capture_accepts_the_documented_step_and_every_call(tmp_path, web):
+    out = tmp_path / "out"
+    model, batch = image2d_model()
+    step = 1000
+
+    index = capture(model, batch, out, step=step, every=500, web_dir=web, inline_mb=0)
+    skipped = capture(model, batch, out, step=step + 250, every=500, web_dir=web)
+
+    assert skipped is None
+    assert index == out / "step_001000" / "index.html" and index.exists()
+    assert read_graph(out / "step_001000")["meta"]["step"] == step
+    assert list_steps(out) == [out / "step_001000"]
+
+
+def test_capture_rejects_an_unknown_option_by_name(tmp_path, web):
+    out = tmp_path / "out"
+    model, batch = image2d_model()
+    calls = count_forwards(model)
+
+    with pytest.raises(TypeError, match="sample_idx"):
+        capture(model, batch, out, web_dir=web, sample_idx=1)
+
+    assert calls == []
+    assert not out.exists()

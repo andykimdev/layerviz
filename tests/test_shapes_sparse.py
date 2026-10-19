@@ -21,24 +21,30 @@ from tests.models import FakeSparseTensor, points_model, sparse_model
 
 SPARSE_GRID = (8, 8, 8)
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DENSE_NAMES = ("image2d", "volume3d", "tokens", "vector")
+DEFAULT_ORDER = ["image2d", "volume3d", "points", "tokens", "vector", "sparse3d"]
+PLUGIN_NAMES = "[p.name for p in base.plugins()]"
+USER_PLUGIN = "SimpleNamespace(name='user', accepts=lambda output, ctx: False)"
 
 
-def fresh_import_names(code):
+def fresh_import_names(code, setup="import layerviz.shapes.sparse"):
     """
-    Import only layerviz.shapes.sparse in a fresh interpreter and evaluate an expression.
+    Run setup statements in a fresh interpreter and evaluate an expression.
 
     Args:
-        code: Python expression evaluated after the import, printed with repr.
+        code: Python expression evaluated after the setup, printed with repr.
+        setup: Python statements run first, by default importing only the sparse module.
 
     Returns:
         The evaluated value, read back with eval.
     """
-    script = (
-        "import sys; sys.path.insert(0, sys.argv[1]); "
-        "import layerviz.shapes.sparse; "
-        "from layerviz.shapes import base; "
-        f"print(repr({code}))"
+    script = "\n".join(
+        [
+            "import sys",
+            "sys.path.insert(0, sys.argv[1])",
+            setup,
+            "from layerviz.shapes import base",
+            f"print(repr({code}))",
+        ]
     )
     result = subprocess.run(
         [sys.executable, "-I", "-c", script, str(REPO_ROOT)],
@@ -69,16 +75,48 @@ def points_ctx(coords, sample_index=0):
     return base.ShapeContext(sample_index, None, positions, len(positions))
 
 
+def user_capture_setup(early_import, out):
+    """
+    Build setup statements that register a user plugin and then run one capture.
+
+    Args:
+        early_import: Statement run before the plugin is registered, or an empty string.
+        out: Folder the capture writes its bundle into.
+
+    Returns:
+        The setup statements as one string with one statement per line.
+    """
+    return "\n".join(
+        [
+            "from types import SimpleNamespace",
+            early_import,
+            "import layerviz",
+            "from tests.models import image2d_model",
+            f"layerviz.register_shape({USER_PLUGIN})",
+            "model, batch = image2d_model()",
+            f"layerviz.capture(model, batch, {str(out)!r})",
+        ]
+    )
+
+
+@pytest.mark.slow
 def test_importing_sparse_does_not_import_spconv():
     loaded = fresh_import_names("sorted(m for m in sys.modules if m.startswith('spconv'))")
     assert loaded == []
 
 
-def test_importing_sparse_alone_orders_registry_for_sparse_and_points():
-    names = fresh_import_names("[p.name for p in base.plugins()]")
-    assert sorted(names) == sorted(DENSE_NAMES + ("sparse3d", "points"))
-    assert names.index("points") < names.index("tokens")
-    assert names.index("sparse3d") < min(names.index(name) for name in DENSE_NAMES)
+@pytest.mark.slow
+def test_importing_sparse_alone_appends_sparse3d_and_puts_points_before_tokens():
+    assert fresh_import_names(PLUGIN_NAMES) == DEFAULT_ORDER
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "early_import", ["", "import layerviz.shapes.dense", "import layerviz.shapes.sparse"]
+)
+def test_user_plugin_registered_before_first_capture_stays_first(early_import, tmp_path):
+    setup = user_capture_setup(early_import, tmp_path)
+    assert fresh_import_names(PLUGIN_NAMES, setup) == ["user", *DEFAULT_ORDER]
 
 
 def test_sparse3d_accepts_duck_typed_sparse_object_only():
@@ -202,18 +240,20 @@ class NamedPlugin:
         self.name = name
 
 
-def test_register_defaults_puts_sparse3d_first_and_points_before_tokens(monkeypatch):
-    monkeypatch.setattr(base, "REGISTRY", [NamedPlugin("image2d"), NamedPlugin("tokens")])
+@pytest.mark.parametrize(
+    ("start", "expected"),
+    [
+        (["image2d", "tokens"], ["image2d", "points", "tokens", "sparse3d"]),
+        (["image2d"], ["image2d", "points", "sparse3d"]),
+    ],
+)
+def test_register_defaults_appends_sparse3d_and_puts_points_before_tokens(
+    monkeypatch, start, expected
+):
+    monkeypatch.setattr(base, "REGISTRY", [NamedPlugin(name) for name in start])
     sparse.register_defaults()
     sparse.register_defaults()
-    names = [plugin.name for plugin in base.REGISTRY]
-    assert names == ["sparse3d", "image2d", "points", "tokens"]
-
-
-def test_import_registers_both_plugins():
-    names = [plugin.name for plugin in base.REGISTRY]
-    assert "sparse3d" in names
-    assert "points" in names
+    assert [plugin.name for plugin in base.REGISTRY] == expected
 
 
 def test_plugin_for_picks_sparse3d_for_sparse_output():

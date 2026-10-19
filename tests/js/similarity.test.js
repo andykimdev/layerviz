@@ -7,17 +7,14 @@
  *
  * Special Notes:
  * - tests/test_similarity_reference.py writes the fixture and runs this file.
+ * - Float16 cases run on decodeFloat16 from format.js, the decoder the page uses.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
-import {
-  float16ToFloat32,
-  cosineSimilarity,
-  percentileRank,
-  nearestIndex,
-} from "../../layerviz/web/similarity.js";
+import { decodeFloat16 } from "../../layerviz/web/format.js";
+import { cosineSimilarity, percentileRank, nearestIndex } from "../../layerviz/web/similarity.js";
 
 /**
  * Assert two numeric sequences have equal length and match within a tolerance.
@@ -52,17 +49,17 @@ function gridPositions(sizes) {
   return Float32Array.from(points.flat());
 }
 
-test("float16ToFloat32 decodes zero, signed zero, one, max, subnormal, and infinity", () => {
+test("decodeFloat16 decodes zero, signed zero, one, max, subnormal, and infinity", () => {
   const bits = Uint16Array.from([0x0000, 0x8000, 0x3c00, 0x7bff, 0x0001, 0x7c00, 0xfc00]);
-  const out = float16ToFloat32(bits);
+  const out = decodeFloat16(bits.buffer);
   assert.ok(out instanceof Float32Array);
   assert.deepEqual(Array.from(out), [0, -0, 1, 65504, Math.fround(2 ** -24), Infinity, -Infinity]);
   assert.ok(Object.is(out[1], -0), "negative zero lost its sign");
   assert.ok(Math.abs(out[4] - 6e-8) < 1e-9, "smallest subnormal is about 6e-8");
 });
 
-test("float16ToFloat32 decodes NaN and negative normals", () => {
-  const out = float16ToFloat32(Uint16Array.from([0x7e00, 0xc000, 0x3555]));
+test("decodeFloat16 decodes NaN and negative normals", () => {
+  const out = decodeFloat16(Uint16Array.from([0x7e00, 0xc000, 0x3555]).buffer);
   assert.ok(Number.isNaN(out[0]));
   assert.equal(out[1], -2);
   assert.equal(out[2], Math.fround(0.333251953125));
@@ -79,6 +76,20 @@ test("cosineSimilarity gives 0 for a zero norm row", () => {
   const scores = Float32Array.from([0, 0, 1, 1]);
   assert.deepEqual(Array.from(cosineSimilarity(scores, 2, 2, 0)), [0, 0]);
   assertClose(cosineSimilarity(scores, 2, 2, 1), [0, 1], 1e-6);
+});
+
+test("cosineSimilarity gives 0 for a row holding Infinity or NaN", () => {
+  const scores = Float32Array.from([1, 0, Infinity, 0, NaN, 1, 1, 1]);
+  const sim = cosineSimilarity(scores, 4, 2, 0);
+  assert.deepEqual(Array.from(sim), [1, 0, 0, Math.fround(Math.SQRT1_2)]);
+  assert.deepEqual(Array.from(cosineSimilarity(scores, 4, 2, 1)), [0, 0, 0, 0]);
+});
+
+test("percentileRank gives a finite rank for every row after a non finite row", () => {
+  const scores = Float32Array.from([1, 0, Infinity, 0, NaN, 1, 1, 1]);
+  const ranks = percentileRank(cosineSimilarity(scores, 4, 2, 0));
+  assert.ok(Array.from(ranks).every(Number.isFinite), `ranks ${Array.from(ranks)}`);
+  assert.deepEqual(Array.from(ranks), [1, Math.fround(1 / 6), Math.fround(1 / 6), Math.fround(2 / 3)]);
 });
 
 test("cosineSimilarity throws a RangeError naming the index and n for an index out of range", () => {
@@ -137,7 +148,7 @@ test("browser similarity matches the NumPy reference fixture", (t) => {
     return;
   }
   const fixture = JSON.parse(readFileSync(path, "utf8"));
-  const scores = float16ToFloat32(Uint16Array.from(fixture.scores_uint16));
+  const scores = decodeFloat16(Uint16Array.from(fixture.scores_uint16).buffer);
   const sim = cosineSimilarity(scores, fixture.n, fixture.k, fixture.index);
   assertClose(sim, fixture.similarity, 1e-3);
   assertClose(percentileRank(sim), fixture.ranks, 1e-6);

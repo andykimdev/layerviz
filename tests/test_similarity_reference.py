@@ -8,6 +8,9 @@ Purpose:
 
 Special Notes:
 
+- The Node script decodes the fixture scores with decodeFloat16 from format.js, so the
+  check covers the decoder the page uses.
+
 - Fails when node is not on PATH, since the full check runs node anyway.
 - Uses no scipy so ranks follow the module definition.
 """

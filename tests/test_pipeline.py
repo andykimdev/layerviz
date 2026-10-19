@@ -4,18 +4,23 @@ Test that run_pipeline turns one model and batch into captured, reduced layers.
 Purpose:
 
 - Check layer kinds per shape, inherited sparse positions, overrides, and skips.
-- Check the budget, the channel cap, and that the model modes are restored.
+- Check that the model modes are restored and a raising forward leaves no trace behind.
+
+Special Notes:
+
+- The budget and size cap tests live in test_pipeline_budget.py.
 """
+
+import copy
 
 import numpy as np
 import pytest
 import torch
 from torch import nn
 
-from layerviz.budget import BYTES_PER_POSITION, COMPARE_BYTES_PER_POSITION, MB
-from layerviz.bundle import LayerPayload, encode_channels, encode_layer, layer_overhead
 from layerviz.pipeline import CaptureOptions, prepared, run_pipeline
 from layerviz.shapes import base
+from layerviz.tags import tags_of
 from tests.models import (
     ALL_SHAPES,
     FakeSparseTensor,
@@ -23,7 +28,6 @@ from tests.models import (
     image2d_model,
     make_voxel_indices,
     sparse_model,
-    wide_volume3d_model,
 )
 
 TOKEN_LAYERS = ["0", "1.dropout1", "1.norm1", "1.linear1", "1.dropout", "1.linear2"]
@@ -51,17 +55,6 @@ def isolated_registry(monkeypatch: pytest.MonkeyPatch) -> None:
 def layers_by_name(result) -> dict:
     """Map each captured layer name to its CapturedLayer."""
     return {layer.node.name: layer for layer in result.layers}
-
-
-def mb_for(positions: int, overhead: int = 0) -> float:
-    """Return the size in megabytes that holds exactly this many positions and overhead bytes."""
-    return (positions * BYTES_PER_POSITION + overhead) / MB
-
-
-def largest_overhead(model, batch) -> int:
-    """Return the largest layer file overhead among the model's full, untrimmed layers."""
-    layers = run_pipeline(model, batch, CaptureOptions()).layers
-    return max(layer_overhead(layer.data) for layer in layers)
 
 
 class Tagger(nn.Module):
@@ -95,6 +88,25 @@ class Failing(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Raise a RuntimeError."""
         raise RuntimeError("boom")
+
+
+class FailingOnce(nn.Module):
+    """
+    Raise on the first forward while armed, then return the input unchanged.
+
+    """
+
+    def __init__(self, armed: bool = True) -> None:
+        """Set whether the next forward raises."""
+        super().__init__()
+        self.armed = armed
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Raise a RuntimeError once when armed, else return x."""
+        if self.armed:
+            self.armed = False
+            raise RuntimeError("boom")
+        return x
 
 
 class TaggedNet(nn.Module):
@@ -149,6 +161,12 @@ def test_every_shape_captures_one_layer_per_module_with_its_kind(shape: str) -> 
     assert [(layer.node.name, layer.data.kind) for layer in result.layers] == (
         EXPECTED_LAYERS[shape]
     )
+
+
+@pytest.mark.parametrize("shape", sorted(ALL_SHAPES))
+def test_every_shape_skips_only_the_outputs_no_plugin_accepts(shape: str) -> None:
+    model, batch = ALL_SHAPES[shape]()
+    result = run_pipeline(model, batch, CaptureOptions())
     assert result.skipped == EXPECTED_SKIPS.get(shape, {})
 
 
@@ -169,79 +187,33 @@ def test_points_input_layer_sits_on_the_batch_coordinates() -> None:
     np.testing.assert_array_equal(result.input.features, batch[1][0].numpy())
 
 
-def test_budget_subsamples_every_layer_and_reduces_the_kept_rows() -> None:
-    model, batch = image2d_model()
-    layer_mb = mb_for(10, largest_overhead(model, batch))
-    result = run_pipeline(model, batch, CaptureOptions(layer_mb=layer_mb))
-    layers = layers_by_name(result)
-    assert [(layer.total, layer.kept) for layer in result.layers] == [(256, 10), (64, 10)]
-    first = layers["0"]
-    assert first.data.positions.shape == (10, 2)
-    assert first.data.features.shape == (10, 4)
-    assert first.reduced.rgb.shape == (10, 3)
-    assert first.channels[0].dtype == np.uint8
-    assert first.channels[0].shape == (10, 4)
-    np.testing.assert_array_equal(first.channels[1], np.arange(4))
+# Each plain [N, C] Linear child of a sparse model and the sparse layer it inherits from.
+SPARSE_CHILDREN = [("0.linear", "0"), ("2.linear", "1")]
 
 
-def test_channel_file_with_its_header_fits_the_layer_cap() -> None:
-    torch.manual_seed(0)
-    model, batch = nn.Sequential(nn.Linear(10, 100)), torch.randn(64, 10)
-    layer_mb = 4096 / MB
-    layer = run_pipeline(model, batch, CaptureOptions(layer_mb=layer_mb)).layers[0]
-    payload = LayerPayload(layer.data, layer.reduced, channels=layer.channels)
-    size, kept = len(encode_channels(payload)), len(layer.channels[1])
-    positions = (4096 - largest_overhead(model, batch)) // BYTES_PER_POSITION
-    assert (layer.kept, size <= 4096, 0 < kept < 100) == (positions, True, True)
+@pytest.mark.parametrize(("child", "grid"), [("0.linear", (8, 8, 8)), ("2.linear", (4, 4, 4))])
+def test_sparse_linear_layers_take_the_kind_and_grid_of_their_ancestor(
+    child: str, grid: tuple
+) -> None:
+    model, batch = sparse_model()
+    data = layers_by_name(run_pipeline(model, batch, CaptureOptions()))[child].data
+    assert (data.kind, data.grid) == ("sparse3d", grid)
 
 
-def test_layer_trimmed_to_the_cap_encodes_within_layer_mb() -> None:
-    model, batch = wide_volume3d_model()
-    layer = run_pipeline(model, batch, CaptureOptions(layer_mb=4096 / MB)).layers[-1]
-    size = len(encode_layer(LayerPayload(layer.data, layer.reduced)))
-    assert (layer.kept < layer.total, size <= 4096) == (True, True)
-
-
-def test_channels_under_the_layer_cap_are_all_kept() -> None:
-    torch.manual_seed(0)
-    model, batch = nn.Sequential(nn.Linear(10, 6)), torch.randn(4, 10)
-    data, kept = run_pipeline(model, batch, CaptureOptions(layer_mb=1)).layers[0].channels
-    assert (data.shape, kept.tolist()) == ((4, 6), list(range(6)))
-
-
-def test_bytes_per_position_option_sets_the_kept_positions() -> None:
-    # 2360 bytes past the file overhead hold 29 positions of 79 bytes but only 28 of 82 bytes.
-    model, batch = image2d_model()
-    layer_mb = (2360 + largest_overhead(model, batch)) / MB
-    opts = CaptureOptions(layer_mb=layer_mb, bytes_per_position=COMPARE_BYTES_PER_POSITION)
-    assert [layer.kept for layer in run_pipeline(model, batch, opts).layers] == [28, 28]
-
-
-def test_default_bytes_per_position_is_the_single_mode_size() -> None:
-    assert CaptureOptions().bytes_per_position == BYTES_PER_POSITION
-
-
-def test_layer_cap_below_one_compare_position_names_its_size() -> None:
-    model, batch = image2d_model()
-    opts = CaptureOptions(layer_mb=80 / MB, bytes_per_position=COMPARE_BYTES_PER_POSITION)
-    with pytest.raises(ValueError, match=r"at least 7\.82e-05 MB"):
-        run_pipeline(model, batch, opts)
-
-
-def test_layer_cap_below_one_position_raises() -> None:
-    model, batch = image2d_model()
-    with pytest.raises(ValueError, match="layer_mb"):
-        run_pipeline(model, batch, CaptureOptions(layer_mb=mb_for(0.5)))
-
-
-def test_sparse_linear_layers_inherit_positions_of_their_sparse_ancestor() -> None:
+@pytest.mark.parametrize(("child", "ancestor"), SPARSE_CHILDREN)
+def test_sparse_linear_layers_inherit_positions_of_their_sparse_ancestor(
+    child: str, ancestor: str
+) -> None:
     model, batch = sparse_model()
     layers = layers_by_name(run_pipeline(model, batch, CaptureOptions()))
-    for child, ancestor, grid in [("0.linear", "0", (8, 8, 8)), ("2.linear", "1", (4, 4, 4))]:
-        data = layers[child].data
-        assert (data.kind, data.grid) == ("sparse3d", grid)
-        np.testing.assert_array_equal(data.positions, layers[ancestor].data.positions)
-        np.testing.assert_allclose(data.features, layers[child].node.output.numpy())
+    np.testing.assert_array_equal(layers[child].data.positions, layers[ancestor].data.positions)
+
+
+@pytest.mark.parametrize("child", ["0.linear", "2.linear"])
+def test_sparse_linear_layers_keep_their_own_output_as_features(child: str) -> None:
+    model, batch = sparse_model()
+    layer = layers_by_name(run_pipeline(model, batch, CaptureOptions()))[child]
+    np.testing.assert_allclose(layer.data.features, layer.node.output.numpy())
 
 
 def two_sample_sparse_batch() -> FakeSparseTensor:
@@ -253,23 +225,50 @@ def two_sample_sparse_batch() -> FakeSparseTensor:
     return FakeSparseTensor(torch.randn(50, 4), indices, [8, 8, 8], 2)
 
 
+def two_sample_layers(sample: int) -> dict:
+    """Capture the sparse model on the two sample batch and map names to captured layers."""
+    model, _ = sparse_model()
+    opts = CaptureOptions(sample_index=sample)
+    return layers_by_name(run_pipeline(model, two_sample_sparse_batch(), opts))
+
+
 @pytest.mark.parametrize("sample", [0, 1])
-def test_linear_layers_of_a_two_sample_sparse_batch_inherit_the_sample_rows(
+def test_every_sample_of_a_two_sample_sparse_batch_captures_every_sparse_layer(
     sample: int,
 ) -> None:
-    model, _ = sparse_model()
-    result = run_pipeline(model, two_sample_sparse_batch(), CaptureOptions(sample_index=sample))
-    layers = layers_by_name(result)
-    assert [(layer.node.name, layer.data.kind) for layer in result.layers] == (
+    layers = two_sample_layers(sample)
+    assert [(name, layer.data.kind) for name, layer in layers.items()] == (
         EXPECTED_LAYERS["sparse"]
     )
-    for child, ancestor in [("0.linear", "0"), ("2.linear", "1")]:
-        rows = layers[ancestor].node.output.indices[:, 0] == sample
-        data = layers[child].data
-        assert data.grid == layers[ancestor].data.grid
-        np.testing.assert_array_equal(data.positions, layers[ancestor].data.positions)
-        np.testing.assert_allclose(data.features, layers[child].node.output[rows].numpy())
-    assert len(layers["0.linear"].data.positions) == (30 if sample == 0 else 20)
+
+
+@pytest.mark.parametrize("sample", [0, 1])
+@pytest.mark.parametrize(("child", "ancestor"), SPARSE_CHILDREN)
+def test_linear_layers_of_a_two_sample_sparse_batch_inherit_the_sample_positions(
+    sample: int, child: str, ancestor: str
+) -> None:
+    layers = two_sample_layers(sample)
+    child_data, ancestor_data = layers[child].data, layers[ancestor].data
+    assert child_data.grid == ancestor_data.grid
+    np.testing.assert_array_equal(child_data.positions, ancestor_data.positions)
+
+
+@pytest.mark.parametrize("sample", [0, 1])
+@pytest.mark.parametrize(("child", "ancestor"), SPARSE_CHILDREN)
+def test_linear_layers_of_a_two_sample_sparse_batch_keep_the_sample_rows(
+    sample: int, child: str, ancestor: str
+) -> None:
+    layers = two_sample_layers(sample)
+    rows = layers[ancestor].node.output.indices[:, 0] == sample
+    expected = layers[child].node.output[rows].numpy()
+    np.testing.assert_allclose(layers[child].data.features, expected)
+
+
+@pytest.mark.parametrize(("sample", "voxels"), [(0, 30), (1, 20)])
+def test_two_sample_sparse_batch_keeps_the_voxels_of_the_chosen_sample(
+    sample: int, voxels: int
+) -> None:
+    assert len(two_sample_layers(sample)["0.linear"].data.positions) == voxels
 
 
 def test_shapes_option_overrides_a_2d_output_to_tokens() -> None:
@@ -310,7 +309,9 @@ def test_unaccepted_and_nan_outputs_are_skipped_and_the_run_finishes() -> None:
 
 
 def test_sample_with_no_voxels_skips_its_sparse_layers() -> None:
-    model, batch = sparse_model()
+    model, one = sparse_model()
+    # Every voxel stays in sample 0, so sample 1 is in the batch but holds no voxels.
+    batch = FakeSparseTensor(one.features, one.indices, one.spatial_shape, 2)
     result = run_pipeline(model, batch, CaptureOptions(sample_index=1))
     reason = "no positions in this sample"
     assert result.skipped == {
@@ -342,9 +343,46 @@ def test_train_and_grad_modes_are_restored_when_the_forward_raises() -> None:
         run_pipeline(model, torch.randn(4, 10), CaptureOptions())
     assert [m.training for m in model.modules()] == [True, True, True]
     assert torch.is_grad_enabled()
-    assert all(not m._forward_hooks and not m._forward_pre_hooks for m in model.modules())
 
 
+def trace_summary(result) -> tuple:
+    """Return the node names, the provenance edges, and the captured layer names of a run."""
+    nodes = [node.name for node in result.trace.nodes]
+    return nodes, result.trace.edges, [layer.node.name for layer in result.layers]
+
+
+def test_capture_after_a_raising_forward_traces_like_a_fresh_model() -> None:
+    torch.manual_seed(0)
+    model, batch = nn.Sequential(nn.Linear(10, 3), FailingOnce()), torch.randn(4, 10)
+    fresh = copy.deepcopy(model)
+    fresh[1].armed = False
+    with pytest.raises(RuntimeError, match="boom"):
+        run_pipeline(model, batch, CaptureOptions())
+    again = trace_summary(run_pipeline(model, batch, CaptureOptions()))
+    assert again[0] == ["input", "", "0", "1"]
+    assert again == trace_summary(run_pipeline(fresh, batch, CaptureOptions()))
+
+
+
+def test_plain_forward_after_a_raising_capture_returns_an_untagged_output() -> None:
+    # A hook left behind would tag the output of every later forward with its module name.
+    torch.manual_seed(0)
+    model, batch = nn.Sequential(nn.Linear(10, 3), FailingOnce()), torch.randn(4, 10)
+    with pytest.raises(RuntimeError, match="boom"):
+        run_pipeline(model, batch, CaptureOptions())
+    assert tags_of([model(batch)]) == frozenset()
+
+
+
+def test_batch_after_a_raising_capture_carries_no_tag() -> None:
+    torch.manual_seed(0)
+    model, batch = nn.Sequential(nn.Linear(10, 3), FailingOnce()), torch.randn(4, 10)
+    with pytest.raises(RuntimeError, match="boom"):
+        run_pipeline(model, batch, CaptureOptions())
+    assert tags_of([batch]) == frozenset()
+
+
+@pytest.mark.slow
 def test_prepared_unwraps_a_compiled_model_into_eval_and_no_grad() -> None:
     model, _ = image2d_model()
     model.train()

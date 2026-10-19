@@ -14,7 +14,7 @@ Special Notes:
 
 import pytest
 
-from layerviz.layout import Box, Placed, layout_graph
+from layerviz.layout import Placed, layout_graph
 from layerviz.trace import Trace, TraceNode
 
 ROOT = ""
@@ -30,21 +30,25 @@ def make_trace(leaves, containers, edges):
         edges: List of (source, target) leaf name pairs.
 
     Returns:
-        A Trace whose nodes list the input, the root, the containers, then the leaves.
+        A Trace whose nodes list the input, the root, the containers, then the leaves, and
+        whose children map the root and each container to its child names.
     """
     nodes = [
         TraceNode(name="input", type="Tensor", parent=None, index=0),
-        TraceNode(name=ROOT, type="Net", parent=None, index=1, leaf=False),
+        TraceNode(name=ROOT, type="Net", parent=None, index=1),
     ]
     nodes += [
-        TraceNode(name=name, type="Box", parent=parent, index=len(nodes), leaf=False)
+        TraceNode(name=name, type="Box", parent=parent, index=len(nodes))
         for name, parent in containers
     ]
     nodes += [
         TraceNode(name=name, type="Leaf", parent=parent, index=len(nodes) + i)
         for i, (name, parent) in enumerate(leaves)
     ]
-    return Trace(nodes=nodes, edges=list(edges))
+    children = {ROOT: [], **{name: [] for name, _ in containers}}
+    for name, parent in [*containers, *leaves]:
+        children[parent].append(name)
+    return Trace(nodes=nodes, edges=list(edges), children=children)
 
 
 def layout_inputs(trace):
@@ -56,8 +60,13 @@ def layout_inputs(trace):
 
     Returns:
         A tuple of leaf names in execution order, edges, and a name to parent dict.
+
+    Notes:
+        The leaves are the nodes that are not keys of trace.children, since make_trace keys
+        only the root and the containers.
     """
-    leaf_names = [node.name for node in sorted(trace.nodes, key=lambda n: n.index) if node.leaf]
+    ordered = sorted(trace.nodes, key=lambda n: n.index)
+    leaf_names = [node.name for node in ordered if node.name not in trace.children]
     parents = {node.name: node.parent for node in trace.nodes}
     return leaf_names, trace.edges, parents
 
@@ -87,6 +96,48 @@ def box_tuple(box):
         A tuple of name, depth, and the four extents.
     """
     return box.name, box.depth, (box.x0, box.y0, box.x1, box.y1)
+
+
+def boxes_overlap(first, second):
+    """
+    Tell whether two boxes share any area.
+
+    Args:
+        first: A Box.
+        second: A Box.
+
+    Returns:
+        True when the two boxes overlap on both axes.
+    """
+    return (first.x0 < second.x1 and second.x0 < first.x1
+            and first.y0 < second.y1 and second.y0 < first.y1)
+
+
+def strictly_inside(inner, outer):
+    """
+    Tell whether one box lies inside another without touching its edges.
+
+    Args:
+        inner: The Box that should be enclosed.
+        outer: The Box that should enclose it.
+
+    Returns:
+        True when every edge of inner is strictly within outer.
+    """
+    return (outer.x0 < inner.x0 and inner.x1 < outer.x1
+            and outer.y0 < inner.y0 and inner.y1 < outer.y1)
+
+
+def deep_tree_with_sibling():
+    """
+    Build a tree three containers deep with a sibling container at the next rank.
+
+    Returns:
+        A Trace where b1.c1.d1 holds leaf a, b1 holds leaf b, and sibling b2 holds leaf c.
+    """
+    leaves = [("a", "b1.c1.d1"), ("b", "b1"), ("c", "b2")]
+    containers = [("b1", ROOT), ("b1.c1", "b1"), ("b1.c1.d1", "b1.c1"), ("b2", ROOT)]
+    return make_trace(leaves, containers, [("input", "a"), ("a", "b"), ("b", "c")])
 
 
 def test_linear_chain_gives_consecutive_ranks_at_x_zero():
@@ -173,9 +224,43 @@ def test_nested_containers_give_nested_boxes_with_larger_outer_margin():
     _, boxes = layout_graph(*layout_inputs(trace))
 
     assert [box_tuple(box) for box in boxes] == [
-        (ROOT, 0, pytest.approx((-0.9, 0.1, 0.9, 3.9))),
-        ("outer", 1, pytest.approx((-0.6, 0.4, 0.6, 3.6))),
+        (ROOT, 0, pytest.approx((-0.45, 0.55, 0.45, 3.45))),
+        ("outer", 1, pytest.approx((-0.4, 0.6, 0.4, 3.4))),
         ("outer.inner", 2, pytest.approx((-0.3, 0.7, 0.3, 2.3))),
+    ]
+
+
+def deep_tree_boxes():
+    """Return the boxes of the deep tree with a sibling, keyed by container name."""
+    _, boxes = layout_graph(*layout_inputs(deep_tree_with_sibling()))
+    return {box.name: box for box in boxes}
+
+
+@pytest.mark.parametrize("name, parent", [
+    ("b1", ROOT), ("b1.c1", "b1"), ("b1.c1.d1", "b1.c1"), ("b2", ROOT),
+])
+def test_nested_box_lies_strictly_inside_its_parent_box(name, parent):
+    boxes = deep_tree_boxes()
+
+    assert strictly_inside(boxes[name], boxes[parent])
+
+
+@pytest.mark.parametrize("other", ["b1", "b1.c1", "b1.c1.d1"])
+def test_sibling_container_box_does_not_overlap_the_other_branch(other):
+    boxes = deep_tree_boxes()
+
+    assert not boxes_overlap(boxes["b2"], boxes[other])
+
+
+def test_container_margin_counts_only_the_container_levels_inside_it():
+    _, boxes = layout_graph(*layout_inputs(deep_tree_with_sibling()))
+
+    assert [box_tuple(box) for box in boxes] == [
+        (ROOT, 0, pytest.approx((-0.475, 0.525, 0.475, 3.475))),
+        ("b1", 1, pytest.approx((-0.45, 0.55, 0.45, 2.45))),
+        ("b2", 1, pytest.approx((-0.3, 2.7, 0.3, 3.3))),
+        ("b1.c1", 2, pytest.approx((-0.4, 0.6, 0.4, 1.4))),
+        ("b1.c1.d1", 3, pytest.approx((-0.3, 0.7, 0.3, 1.3))),
     ]
 
 

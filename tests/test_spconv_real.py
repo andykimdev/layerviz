@@ -22,8 +22,8 @@ import torch
 from torch import nn
 
 from layerviz.api import capture
-from tests.test_api import read_graph, read_positions
-from tests.test_bundle import read_frame
+from tests.harness import read_graph, read_positions
+from tests.models import read_frame
 
 VOXELS = 50
 GRID = 16

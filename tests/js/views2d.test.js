@@ -1,9 +1,10 @@
 /**
- * Test the pure pixel helpers of grid2d.js and the colormaps of colors.js.
+ * Test the pure pixel helpers of grid2d.js, the colormaps of colors.js, and legend.js.
  *
  * Purpose:
  * - Pin how positions land on image and volume grids, and how tokens wrap.
  * - Check the scatter normalization, the click to position mapping, and every color mode.
+ * - Check that resetRoot empties a root and puts the legend caption back.
  *
  * Special Notes:
  * - Records are built by hand in the shape format.js returns, so no file decoding runs here.
@@ -31,6 +32,7 @@ import {
   colorsFrom,
   legend,
 } from "../../layerviz/web/colors.js";
+import { resetRoot } from "../../layerviz/web/legend.js";
 
 /**
  * Build a decoded layer record whose positions are the row major cells of a grid.
@@ -304,4 +306,44 @@ test("legend labels each mode", () => {
   assert.equal(legend("joint"), "PCA RGB, joint fit");
   assert.equal(legend("similarity"), "Similarity percentile, low to high");
   assert.equal(legend("channel"), "Channel value, low to high");
+});
+
+/**
+ * Build a root element stub that records its children like a DOM node does.
+ *
+ * @param {object[]} children Children the root starts with.
+ * @returns {object} A stub with children, replaceChildren, and append.
+ */
+function rootStub(children) {
+  return {
+    children: [...children],
+    replaceChildren() {
+      this.children = [];
+    },
+    append(child) {
+      this.children.push(child);
+    },
+  };
+}
+
+globalThis.document = {
+  createElement: (tagName) => ({ tagName, className: "", textContent: "" }),
+};
+
+test("resetRoot empties the root and adds the legend caption for the mode", () => {
+  const root = rootStub([{ tagName: "canvas" }, { tagName: "div" }]);
+  resetRoot(root, { mode: "similarity" });
+  assert.deepEqual(root.children, [
+    {
+      tagName: "div",
+      className: "layerviz-legend",
+      textContent: "Similarity percentile, low to high",
+    },
+  ]);
+});
+
+test("resetRoot leaves the root empty when the state has no mode", () => {
+  const root = rootStub([{ tagName: "canvas" }]);
+  resetRoot(root, {});
+  assert.deepEqual(root.children, []);
 });

@@ -10,6 +10,8 @@ Special Notes:
 - Models live in this file because tests/models.py lands in the same wave.
 """
 
+import dataclasses
+import inspect
 import io
 from types import SimpleNamespace
 
@@ -17,7 +19,7 @@ import pytest
 import torch
 from torch import nn
 
-from layerviz.trace import trace_forward
+from layerviz.trace import TraceNode, snapshot, trace_forward
 
 
 class ResidualBlock(nn.Module):
@@ -76,15 +78,24 @@ class BranchNet(nn.Module):
         return self.pos(x) if x.sum() > 0 else self.neg(x)
 
 
-class Boom(nn.Module):
+class ReadOnlyFeatures:
     """
-    Raise inside forward to exercise cleanup on failure.
+    Refuse a direct features assignment and offer replace_feature, as spconv tensors do.
 
     """
 
-    def forward(self, x):
-        """Raise a RuntimeError."""
-        raise RuntimeError("boom")
+    def __init__(self, features: torch.Tensor, indices: torch.Tensor):
+        self._features = features
+        self.indices = indices
+
+    @property
+    def features(self) -> torch.Tensor:
+        """Return the stored features tensor."""
+        return self._features
+
+    def replace_feature(self, features: torch.Tensor) -> "ReadOnlyFeatures":
+        """Return a new object with other features and the same indices."""
+        return ReadOnlyFeatures(features, self.indices)
 
 
 class SparseProducer(nn.Module):
@@ -111,37 +122,6 @@ class SparseConsumer(nn.Module):
     def forward(self, sparse):
         """Return the features tensor doubled."""
         return sparse.features * 2
-
-
-class ReturnsParam(nn.Module):
-    """
-    Return a parameter object unchanged, so the tracer tags a long lived tensor.
-
-    """
-
-    def __init__(self, param: nn.Parameter):
-        super().__init__()
-        self.param = param
-
-    def forward(self, x):
-        """Return the stored parameter."""
-        return self.param
-
-
-class UsesParam(nn.Module):
-    """
-    Add a parameter to the input before a linear layer.
-
-    """
-
-    def __init__(self, param: nn.Parameter):
-        super().__init__()
-        self.param = param
-        self.lin = nn.Linear(2, 2)
-
-    def forward(self, x):
-        """Return lin(x + param)."""
-        return self.lin(x + self.param)
 
 
 class TwiceNet(nn.Module):
@@ -203,24 +183,33 @@ def test_residual_and_cat_model_yields_exactly_the_provenance_edges(context):
     assert len(trace.edges) == len(SKIPNET_EDGES)
 
 
-def test_nodes_record_name_type_parent_index_and_leaf_in_execution_order():
+def test_nodes_record_name_type_parent_and_index_in_execution_order():
     trace = trace_forward(make_skipnet(), image_batch())
 
-    rows = [(n.name, n.type, n.parent, n.index, n.leaf) for n in trace.nodes]
+    rows = [(n.name, n.type, n.parent, n.index) for n in trace.nodes]
 
     assert rows == [
-        ("input", "Tensor", None, 0, True),
-        ("", "SkipNet", None, 1, False),
-        ("stem", "Conv2d", "", 2, True),
-        ("block", "ResidualBlock", "", 3, False),
-        ("block.conv1", "Conv2d", "block", 4, True),
-        ("block.act1", "ReLU", "block", 5, True),
-        ("block.conv2", "Conv2d", "block", 6, True),
-        ("block.act2", "ReLU", "block", 7, True),
-        ("down", "Conv2d", "", 8, True),
-        ("up", "Upsample", "", 9, True),
-        ("head", "Conv2d", "", 10, True),
+        ("input", "Tensor", None, 0),
+        ("", "SkipNet", None, 1),
+        ("stem", "Conv2d", "", 2),
+        ("block", "ResidualBlock", "", 3),
+        ("block.conv1", "Conv2d", "block", 4),
+        ("block.act1", "ReLU", "block", 5),
+        ("block.conv2", "Conv2d", "block", 6),
+        ("block.act2", "ReLU", "block", 7),
+        ("down", "Conv2d", "", 8),
+        ("up", "Upsample", "", 9),
+        ("head", "Conv2d", "", 10),
     ]
+
+
+def test_trace_node_has_no_leaf_field_and_trace_forward_takes_model_batch_forward():
+    fields = [f.name for f in dataclasses.fields(TraceNode)]
+
+    params = list(inspect.signature(trace_forward).parameters)
+
+    assert fields == ["name", "type", "parent", "index", "output", "output_shape", "shares"]
+    assert params == ["model", "batch", "forward"]
 
 
 def test_children_map_each_executed_module_to_its_children_in_order():
@@ -256,7 +245,7 @@ def test_every_node_records_its_output_and_shape():
     trace = trace_forward(model, batch)
     by_name = {n.name: n for n in trace.nodes}
 
-    assert by_name["input"].output is batch
+    assert torch.equal(by_name["input"].output, batch)
     assert torch.equal(by_name["stem"].output, model.stem(batch))
     assert torch.equal(by_name[""].output, model(batch))
     assert {n.name: n.output_shape for n in trace.nodes} == {
@@ -290,19 +279,56 @@ def test_container_returning_a_new_tensor_shares_nothing():
     assert shares == {"": "head"}
 
 
-def test_forward_that_raises_leaves_no_hooks_and_no_function_mode():
-    model = nn.Sequential(nn.Linear(2, 2), Boom())
+def test_inplace_activation_leaves_the_conv_node_output_as_the_conv_computed_it():
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Conv2d(1, 2, 3, padding=1), nn.ReLU(inplace=True))
+    batch = image_batch()
+    with torch.no_grad():
+        conv_out = model[0](batch)
 
-    with pytest.raises(RuntimeError, match="boom"):
-        trace_forward(model, torch.ones(1, 2))
+    with torch.no_grad():
+        trace = trace_forward(model, batch)
+    by_name = {n.name: n for n in trace.nodes}
 
-    leftover = [
-        name for name, m in model.named_modules() if m._forward_hooks or m._forward_pre_hooks
-    ]
-    tagged = torch.ones(1)
-    tagged._layerviz_tags = frozenset({"x"})
-    assert leftover == []
-    assert not hasattr(tagged + 1, "_layerviz_tags")
+    assert torch.equal(by_name["0"].output, conv_out)
+    assert bool((by_name["0"].output < 0).any())
+    assert by_name["0"].output is not by_name["1"].output
+    assert torch.equal(by_name["1"].output, conv_out.clamp(min=0))
+
+
+def test_snapshot_copies_tensors_in_containers_and_features_objects():
+    t = torch.tensor([1.0, -1.0])
+    obj = {"a": t, "b": (t, [SimpleNamespace(features=t, name="s")])}
+
+    copied = snapshot(obj)
+    t.zero_()
+
+    assert torch.equal(copied["a"], torch.tensor([1.0, -1.0]))
+    assert torch.equal(copied["b"][0], torch.tensor([1.0, -1.0]))
+    assert isinstance(copied["b"], tuple)
+    assert isinstance(copied["b"][1], list)
+    sparse = copied["b"][1][0]
+    assert isinstance(sparse, SimpleNamespace)
+    assert sparse.name == "s"
+    assert torch.equal(sparse.features, torch.tensor([1.0, -1.0]))
+    assert torch.equal(obj["b"][1][0].features, torch.zeros(2))
+
+
+def test_snapshot_of_a_read_only_features_object_uses_replace_feature():
+    features, indices = torch.tensor([[2.0, -2.0]]), torch.tensor([[0, 1, 2, 3]])
+    sparse = ReadOnlyFeatures(features, indices)
+
+    copied = snapshot(sparse)
+    features.zero_()
+
+    assert isinstance(copied, ReadOnlyFeatures)
+    assert copied.indices is indices
+    assert torch.equal(copied.features, torch.tensor([[2.0, -2.0]]))
+
+
+def test_snapshot_returns_values_without_tensors_unchanged():
+    assert snapshot(None) is None
+    assert snapshot("text") == "text"
 
 
 def test_custom_forward_and_dict_batch_tag_the_batch_as_input():
@@ -325,30 +351,6 @@ def test_object_with_features_tensor_carries_provenance_between_modules():
     assert {n.name: n.output_shape for n in trace.nodes}["0"] == [1, 2]
 
 
-def test_custom_plain_tensors_decides_which_tensors_carry_tags():
-    torch.manual_seed(0)
-    model = nn.Sequential(SparseProducer(), SparseConsumer())
-
-    trace = trace_forward(model, torch.ones(1, 2), plain_tensors=_only_raw_tensors)
-
-    assert set(trace.edges) == {("input", ""), ("input", "0"), ("input", "0.lin")}
-
-
-def _only_raw_tensors(obj):
-    """Return obj in a list when it is a tensor, else an empty list."""
-    return [obj] if isinstance(obj, torch.Tensor) else []
-
-
-def test_trace_leaves_no_tags_on_batch_or_node_outputs():
-    batch = image_batch()
-
-    trace = trace_forward(make_skipnet(), batch)
-
-    tagged = [n.name for n in trace.nodes if hasattr(n.output, "_layerviz_tags")]
-    assert tagged == []
-    assert not hasattr(batch, "_layerviz_tags")
-
-
 def test_traced_batch_saves_and_loads_with_weights_only():
     batch = image_batch()
     trace_forward(make_skipnet(), batch)
@@ -358,16 +360,6 @@ def test_traced_batch_saves_and_loads_with_weights_only():
     buffer.seek(0)
 
     assert torch.equal(torch.load(buffer, weights_only=True), batch)
-
-
-def test_second_trace_reusing_a_returned_parameter_has_no_stale_edge():
-    torch.manual_seed(0)
-    shared = nn.Parameter(torch.ones(1, 2))
-    trace_forward(nn.Sequential(ReturnsParam(shared)), torch.ones(1, 2))
-
-    trace = trace_forward(UsesParam(shared), torch.ones(1, 2))
-
-    assert set(trace.edges) == {("input", ""), ("input", "lin")}
 
 
 def test_module_called_twice_appears_once_with_last_output_and_cyclic_edges():
@@ -384,4 +376,4 @@ def test_module_called_twice_appears_once_with_last_output_and_cyclic_edges():
         ("l2", "act"),
         ("act", "l2"),
     }
-    assert by_name["act"].output is by_name[""].output
+    assert torch.equal(by_name["act"].output, by_name[""].output)

@@ -4,7 +4,7 @@ Test the PCA reduction of one layer's features into RGB, scores, and explained v
 Purpose:
 
 - Check determinism, explained variance, the k rule, and degenerate inputs.
-- Check channel quantization under a byte cap.
+- Check the std floor, PCA sign rules, projection, and RGB scaling.
 """
 
 import numpy as np
@@ -12,7 +12,6 @@ import pytest
 
 from layerviz.reduce import (
     bad_values,
-    channel_bytes,
     fit_pca,
     project,
     reduce_layer,
@@ -239,6 +238,47 @@ def test_standardize_gives_unit_std_and_zero_for_constant_channel():
     np.testing.assert_allclose(z.mean(axis=0), 0.0, atol=1e-5)
 
 
+def with_third_channel(third):
+    """
+    Stack two unit variance channels and one given channel into float32 features.
+
+    Args:
+        third: Values of the third channel, shape [200].
+
+    Returns:
+        float32 array of shape [200, 3].
+    """
+    real = np.random.default_rng(0).standard_normal((200, 2))
+    return np.column_stack([real, third]).astype(np.float32)
+
+
+NOISE = np.random.default_rng(1).standard_normal(200)
+
+
+@pytest.mark.parametrize(
+    "third",
+    [NOISE * 1e-7, (np.float32(1000.0) + (NOISE * 1e-4).astype(np.float32))],
+    ids=["tiny_noise_around_0", "float32_noise_around_1000"],
+)
+def test_fit_pca_gives_no_share_to_a_noise_channel(third):
+    z, _, _ = standardize(with_third_channel(third))
+
+    explained = fit_pca(z).explained
+
+    assert explained[2] == 0.0
+    np.testing.assert_allclose(explained[:2].sum(), 1.0, rtol=1e-6)
+    assert np.array_equal(z[:, 2], np.zeros(200, dtype=np.float32))
+
+
+def test_fit_pca_keeps_a_share_for_a_small_std_channel_around_100():
+    z, _, _ = standardize(with_third_channel(100.0 + NOISE * 0.01))
+
+    explained = fit_pca(z).explained
+
+    assert explained[2] > 0.1
+    np.testing.assert_allclose(z[:, 2].std(), 1.0, atol=1e-5)
+
+
 def test_fit_pca_without_subsampling_ignores_max_rows():
     z, _, _ = standardize(make_features(80, 6))
 
@@ -261,12 +301,13 @@ def test_fit_pca_subsamples_to_max_rows_deterministically():
 
 def test_fit_pca_breaks_skewness_tie_with_positive_largest_loading():
     # Symmetric scores have zero skewness, so the loading rule decides the sign.
-    z = np.array([[-1.0, 0.5], [1.0, -0.5], [-1.0, 0.5], [1.0, -0.5]], dtype=np.float32)
+    z = np.array([[-0.5, 1.0], [0.5, -1.0], [-0.5, 1.0], [0.5, -1.0]], dtype=np.float32)
+    raw = np.linalg.svd(z.astype(np.float64), full_matrices=False)[2][0]
+    assert raw[np.argmax(np.abs(raw))] < 0
 
     fit = fit_pca(z)
 
-    largest = fit.components[0, np.argmax(np.abs(fit.components[0]))]
-    assert largest > 0
+    np.testing.assert_allclose(fit.components[0], [-1 / np.sqrt(5), 2 / np.sqrt(5)], rtol=1e-6)
 
 
 def test_project_returns_float32_scores_for_first_k_components():
@@ -291,40 +332,6 @@ def test_rgb_from_scores_clips_to_percentiles_and_scales():
     assert rgb[100].tolist() == [255, 0, 0]
 
 
-def test_channel_bytes_keeps_all_channels_under_the_cap():
-    features = make_features(50, 6)
-
-    data, kept = channel_bytes(features, cap_bytes=50 * 6)
-
-    assert data.dtype == np.uint8
-    assert data.shape == (50, 6)
-    assert kept.tolist() == [0, 1, 2, 3, 4, 5]
-    assert data.min(axis=0).tolist() == [0] * 6
-    assert data.max(axis=0).tolist() == [255] * 6
-
-
-def test_channel_bytes_keeps_top_variance_channels_over_the_cap():
-    rng = np.random.default_rng(0)
-    scales = np.array([1.0, 9.0, 2.0, 7.0, 0.5], dtype=np.float32)
-    features = (rng.standard_normal((40, 5)) * scales).astype(np.float32)
-
-    data, kept = channel_bytes(features, cap_bytes=40 * 2 + 39)
-
-    assert kept.tolist() == [1, 3]
-    assert data.shape == (40, 2)
-    expected, _ = channel_bytes(features[:, [1, 3]], cap_bytes=10**6)
-    assert np.array_equal(data, expected)
-
-
-def test_channel_bytes_zeroes_constant_channel():
-    features = make_features(30, 3)
-    features[:, 0] = 1.5
-
-    data, _ = channel_bytes(features, cap_bytes=10**6)
-
-    assert np.array_equal(data[:, 0], np.zeros(30, dtype=np.uint8))
-
-
 def test_reduce_layer_zeroes_rgb_columns_1_and_2_for_one_channel():
     reduced = reduce_layer(make_features(50, 1))
 
@@ -332,8 +339,3 @@ def test_reduce_layer_zeroes_rgb_columns_1_and_2_for_one_channel():
     assert np.array_equal(reduced.rgb[:, 1:], np.zeros((50, 2), dtype=np.uint8))
     assert reduced.rgb[:, 0].max() == 255
     assert reduced.rgb[:, 0].min() == 0
-
-
-def test_channel_bytes_rejects_non_2d_input():
-    with pytest.raises(ValueError, match=r"\(4, 3, 2\)"):
-        channel_bytes(np.zeros((4, 3, 2), dtype=np.float32), cap_bytes=100)
