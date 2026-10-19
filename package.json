@@ -1,0 +1,9 @@
+{
+  "name": "layerviz-dev",
+  "private": true,
+  "description": "Lint and duplicate check tools for the layerviz browser modules",
+  "devDependencies": {
+    "eslint": "10.12.0",
+    "jscpd": "5.4.0"
+  }
+}

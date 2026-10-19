@@ -1,0 +1,9 @@
+{
+  "minLines": 10,
+  "format": ["python", "javascript"],
+  "path": ["layerviz"],
+  "ignore": ["**/vendor/**", "**/__pycache__/**"],
+  "gitignore": true,
+  "reporters": ["console"],
+  "exitCode": 1
+}
