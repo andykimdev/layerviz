@@ -4,6 +4,7 @@ Test the comparison page in headless Chromium from multi file comparison bundles
 Purpose:
 - Check two labelled panes, the CKA row, and the fit switch between aligned and joint colors.
 - Check that a click in pane A recolors pane B from its own scores, and the shared camera.
+- Check that both 3D panes draw a full height canvas of the same width.
 - Check that a pair without joint colors disables the joint option and shows a note.
 
 Special Notes:
@@ -30,6 +31,8 @@ VIRIDIS_HIGH = [253, 231, 37]
 NO_JOINT_NOTE = "Joint colors are off, this pair has no joint fit"
 SIMILARITY_NOTE = "Showing PCA until a position is clicked"
 CHANNEL_NOTE = "Showing PCA, channels are not compared"
+# The smallest side views3d.js gives a point cloud canvas.
+VIEW_3D_PX = 480
 
 
 def reseeded(model):
@@ -216,6 +219,18 @@ def test_click_in_3d_pane_a_ranks_each_pane_by_its_own_scores(sparse_out, page):
         assert drawn[high].tolist() == VIRIDIS_HIGH
         assert drawn[low].tolist() == VIRIDIS_LOW
     assert not np.array_equal(colors[0], colors[1])
+    assert errors == []
+
+
+def test_3d_panes_draw_full_height_canvases_of_equal_width(sparse_out, page):
+    node = node_named(sparse_out, "1")
+    with serve_dir(sparse_out) as url:
+        errors = open_bundle(page, url + "index.html")
+        show(page, node["id"])
+        boxes = [page.locator(f'.layerviz-pane[data-pane="{pane}"] canvas').bounding_box()
+                 for pane in ("a", "b")]
+    assert [box["height"] >= VIEW_3D_PX for box in boxes] == [True, True]
+    assert boxes[0]["width"] == pytest.approx(boxes[1]["width"], abs=1)
     assert errors == []
 
 

@@ -303,13 +303,22 @@ function startRenderer(root, scene, camera, bounds) {
   if (typeof devicePixelRatio === "number") {
     renderer.setPixelRatio(devicePixelRatio);
   }
-  renderer.setSize(root.clientWidth || DEFAULT_SIDE_PX, root.clientHeight || DEFAULT_SIDE_PX);
-  const controls = new OrbitControls(camera, renderer.domElement);
+  // A compare pane holds only its caption at this point, so its height is no canvas size.
+  const height = Math.max(root.clientHeight, DEFAULT_SIDE_PX);
+  let width = root.clientWidth || DEFAULT_SIDE_PX;
+  renderer.setSize(width, height);
+  const canvas = renderer.domElement;
+  // The first compare pane is measured before the second exists, so the width follows the pane.
+  Object.assign(canvas.style, { width: "100%", boxSizing: "border-box" });
+  const controls = new OrbitControls(camera, canvas);
   controls.target.set(...bounds.center);
   controls.update();
   // A frame loop keeps panes that share one camera in step when another pane orbits it.
   renderer.setAnimationLoop(() => {
-    const canvas = renderer.domElement;
+    if (canvas.clientWidth && canvas.clientWidth !== width) {
+      width = canvas.clientWidth;
+      renderer.setSize(width, height, false);
+    }
     camera.aspect = canvas.clientWidth / Math.max(canvas.clientHeight, 1) || 1;
     camera.updateProjectionMatrix();
     renderer.render(scene, camera);
