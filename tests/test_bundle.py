@@ -84,7 +84,7 @@ def make_web(root):
         "console.log(twice(10) + helper());\n"
     )
     (web / "style.css").write_text("body { margin: 0; }")
-    (web / "CLAUDE.md").write_text("map")
+    (web / "NOTES.md").write_text("map")
     return web
 
 

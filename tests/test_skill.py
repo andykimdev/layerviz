@@ -1,11 +1,11 @@
 """
-Test that the layerviz skill passes the skill checker and matches the real command line.
+Test that the layerviz skill meets the skill format limits and matches the real command line.
 
 Purpose:
 
-- Check that skill/layerviz passes check_skill.py (A29).
+- Check the SKILL.md name, description, body length, and links against the skill format.
 - Check that every python -m layerviz command in SKILL.md uses a real subcommand and flag.
-- Check that the three eval scenarios and run_evals.sh exist and name Sonnet and Opus (A30).
+- Check that the three eval scenarios and run_evals.sh exist and name Sonnet and Opus.
 - Check that the adapter example captures through the command line and passes check_bundle.py.
 
 Special Notes:
@@ -18,8 +18,6 @@ import importlib
 import json
 import re
 import shlex
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -29,9 +27,11 @@ from layerviz.__main__ import build_parser, main
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILL = ROOT / "skill" / "layerviz"
-CHECK_SKILL = ROOT / ".claude" / "scaffold" / "scripts" / "check_skill.py"
 SCENARIOS = ("cnn_2d.md", "spconv_remote.md", "training_snapshots.md")
 FENCE = re.compile(r"```(?:bash|sh)\n(.*?)```", re.DOTALL)
+# The skill format allows a name of lowercase words joined by hyphens.
+NAME = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+LINK = re.compile(r"\[[^\]]*\]\(([^)\s#]+)")
 # A four digit year, or a model family followed by a version number, names a moment in time.
 DATED = re.compile(r"\b(19|20)\d\d\b|\b(sonnet|opus|haiku|claude)[- ]?\d", re.IGNORECASE)
 
@@ -39,6 +39,17 @@ DATED = re.compile(r"\b(19|20)\d\d\b|\b(sonnet|opus|haiku|claude)[- ]?\d", re.IG
 def skill_body() -> str:
     """Return SKILL.md without its frontmatter."""
     return (SKILL / "SKILL.md").read_text().split("---", 2)[2]
+
+
+def skill_frontmatter() -> dict[str, str]:
+    """Return the top level fields of the SKILL.md frontmatter."""
+    header = (SKILL / "SKILL.md").read_text().split("---", 2)[1]
+    fields = {}
+    for line in header.strip().splitlines():
+        key, sep, value = line.partition(":")
+        if sep and not line.startswith((" ", "\t")):
+            fields[key.strip()] = value.strip()
+    return fields
 
 
 def layerviz_commands(markdown: str) -> list[list[str]]:
@@ -61,12 +72,17 @@ def subcommand_flags() -> dict[str, set[str]]:
             for name, sub in choices.items()}
 
 
-def test_skill_passes_check_skill():
-    """The skill folder passes the mechanical skill authoring checks (A29)."""
-    result = subprocess.run([sys.executable, str(CHECK_SKILL), str(SKILL)],
-                            capture_output=True, text=True)
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stdout.strip().endswith("skill ok")
+def test_skill_meets_the_skill_format_limits():
+    """The name, description, body length, and local links fit the skill format."""
+    fields = skill_frontmatter()
+    assert NAME.match(fields["name"]) and len(fields["name"]) <= 64
+    assert 0 < len(fields["description"]) <= 1024
+    body = skill_body()
+    assert len(body.strip("\n").splitlines()) <= 500
+    links = [t for t in LINK.findall(body) if not t.startswith(("http://", "https://"))]
+    assert links
+    missing = [target for target in links if not (SKILL / target).exists()]
+    assert missing == []
 
 
 def test_skill_body_is_short_and_covers_each_step():
@@ -96,7 +112,7 @@ def test_skill_names_no_date_or_model_version():
 
 
 def test_evals_hold_three_scenarios_and_run_sonnet_and_opus():
-    """The three scenario prompts exist with checklists and the script runs both models (A30)."""
+    """The three scenario prompts exist with checklists and the script runs both models."""
     evals = SKILL / "evals"
     for name in SCENARIOS:
         text = (evals / name).read_text()
