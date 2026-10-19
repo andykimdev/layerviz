@@ -4,3 +4,9 @@ runs/
 # Python caches
 __pycache__/
 *.pyc
+
+# Node tools
+node_modules/
+
+# Packaging builds
+*.egg-info/
